@@ -98,7 +98,6 @@ type Signature struct {
 type DEHash []byte
 
 // Factotum implements an agent, potentially remote, to handle private key operations.
-// Implementations typically provide a NewFactotum() function to set the key.
 type Factotum interface {
 	// DirEntryHash is a summary used in signing and verifying directory entries.
 	DirEntryHash(n, l PathName, a Attribute, p Packing, t Time, dkey, hash []byte) DEHash
@@ -109,7 +108,6 @@ type Factotum interface {
 	// ScalarMult is the bare private key operator, used in unwrapping packed data.
 	// Each call needs security review to ensure it cannot be abused as a signing
 	// oracle. Read https://en.wikipedia.org/wiki/Confused_deputy_problem.
-	// Returns error "no such key" if factotum doesn't hold the necessary private key.
 	ScalarMult(keyHash []byte, c elliptic.Curve, x, y *big.Int) (sx, sy *big.Int, err error)
 
 	// Sign signs a slice of bytes with the factotum's private key.
@@ -221,6 +219,13 @@ type Packer interface {
 	// only that of the Upspin user invoking the method. The Packdata
 	// in entry must contain a wrapped key for that user.
 	Name(config Config, entry *DirEntry, path PathName) error
+
+	// Countersign updates the signatures in the DirEntry when a writer
+	// is in the process of switching to a new key. It checks that
+	// the first existing signature verifies under the old key, copies
+	// that one over the second existing signature, and creates a new
+	// first signature using the key from factotum.
+	Countersign(oldKey PublicKey, f Factotum, d *DirEntry) error
 }
 
 const (
@@ -504,7 +509,7 @@ type DirEntry struct {
 const BlockSize = 1024 * 1024
 
 // DirBlock describes a block of data representing a contiguous section of a file.
-// The block may be of any size, including zero bytes, but in large files is usually
+// The block my be of any non-negative size, but in large files is usually
 // BlockSize long.
 type DirBlock struct {
 	Location Location // Location of data in store.

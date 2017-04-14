@@ -2,11 +2,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package main
+package keyserver
 
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -42,23 +43,25 @@ const (
 // signupHandler implements an http.Handler that handles user creation requests
 // made by 'upspin signup' and the user themselves.
 type signupHandler struct {
-	fact upspin.Factotum
-	key  upspin.KeyServer
-	mail mail.Mail
+	fact    upspin.Factotum
+	key     upspin.KeyServer
+	mail    mail.Mail
+	project string
 
 	rate serverutil.RateLimiter
 }
 
 // newSignupHandler creates a new handler that serves /signup.
-func newSignupHandler(fact upspin.Factotum, key upspin.KeyServer, mailConfig string) (*signupHandler, error) {
+func newSignupHandler(fact upspin.Factotum, key upspin.KeyServer, mailConfig, project string) (*signupHandler, error) {
 	apiKey, _, _, err := parseMailConfig(mailConfig)
 	if err != nil {
 		return nil, err
 	}
 	m := &signupHandler{
-		fact: fact,
-		key:  key,
-		mail: sendgrid.New(apiKey, "upspin.io"),
+		fact:    fact,
+		key:     key,
+		mail:    sendgrid.New(apiKey, "upspin.io"),
+		project: project,
 		rate: serverutil.RateLimiter{
 			Backoff: 1 * time.Minute,
 			Max:     24 * time.Hour,
@@ -75,17 +78,18 @@ func (m *signupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Parse and validate request.
 	v := r.FormValue
+	name, dir, store, pkey, sigR, sigS := v("name"), v("dir"), v("store"), v("key"), v("sigR"), v("sigS")
 	u := &upspin.User{
-		Name: upspin.UserName(v("name")),
+		Name: upspin.UserName(name),
 		Dirs: []upspin.Endpoint{{
 			Transport: upspin.Remote,
-			NetAddr:   upspin.NetAddr(v("dir")),
+			NetAddr:   upspin.NetAddr(dir),
 		}},
 		Stores: []upspin.Endpoint{{
 			Transport: upspin.Remote,
-			NetAddr:   upspin.NetAddr(v("store")),
+			NetAddr:   upspin.NetAddr(store),
 		}},
-		PublicKey: upspin.PublicKey(v("key")),
+		PublicKey: upspin.PublicKey(pkey),
 	}
 	if err := valid.UserName(u.Name); err != nil {
 		errorf(http.StatusBadRequest, "invalid user name: %s", u.Name)
@@ -97,9 +101,6 @@ func (m *signupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sigR, sigS, nowS := v("sigR"), v("sigS"), v("now")
-	create := sigR+sigS+nowS != ""
-
 	// Lookup userName. It must not exist yet.
 	_, err := m.key.Lookup(u.Name)
 	if err == nil {
@@ -109,6 +110,9 @@ func (m *signupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		errorf(http.StatusInternalServerError, "error looking up user: %v", err)
 		return
 	}
+
+	nowS := v("now")
+	create := nowS != ""
 
 	if create {
 		// This is the user clicking the link in the signup mail.
@@ -148,8 +152,8 @@ func (m *signupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Send a note to our internal list, so we're aware of signups.
-		subject := "New signup: " + string(u.Name)
-		body := fmt.Sprintf("%s signed up on %s", u.Name, time.Now().Format(time.Stamp))
+		subject := fmt.Sprintf("New signup on %s: %s", m.project, string(u.Name))
+		body := fmt.Sprintf("%s signed up on %s on %s", u.Name, m.project, time.Now().Format(time.Stamp))
 		err = m.mail.Send(signupNotifyAddress, serverName, subject, body, noHTML)
 		if err != nil {
 			log.Error.Printf("Error sending mail to %q: %v", signupNotifyAddress, err)
@@ -162,6 +166,10 @@ func (m *signupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// We are being called by 'upspin signup'.
 
+	if err := verifySignupSignature(name, dir, store, pkey, sigR, sigS); err != nil {
+		errorf(http.StatusBadRequest, "invalid request: %s", err)
+		return
+	}
 	if r.Method != "POST" {
 		errorf(http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -223,6 +231,22 @@ func (m *signupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Fprintln(w, "OK")
+}
+
+// verifySignupSignature verifies that the new user record comprised of name,
+// dir, store and key were properly signed by the new user using the private key
+// that corresponds to the public key provided.
+func verifySignupSignature(user, dir, store, key, sigR, sigS string) error {
+	var rs, ss big.Int
+	if _, ok := rs.SetString(sigR, 10); !ok {
+		return errors.Str("invalid signature R value")
+	}
+	if _, ok := ss.SetString(sigS, 10); !ok {
+		return errors.Str("invalid signature S value")
+	}
+	sig := upspin.Signature{R: &rs, S: &ss}
+	hash, _ := signupRequestHash(upspin.UserName(user), upspin.NetAddr(dir), upspin.NetAddr(store), upspin.PublicKey(key))
+	return factotum.Verify(hash, sig, upspin.PublicKey(key))
 }
 
 func (m *signupHandler) createUser(u *upspin.User) error {
@@ -337,4 +361,28 @@ func snapshotUser(u upspin.UserName) (upspin.UserName, error) {
 		name = name[:len(name)-len(suffix)-1]
 	}
 	return upspin.UserName(name + "+snapshot@" + domain), nil
+}
+
+// signupRequestHash generates a hash of the supplied arguments
+// that, when signed, is used to prove that a signup request originated
+// from the user that owns the supplied private key.
+// Keep it in sync with cmd/upspin/signup.go.
+func signupRequestHash(name upspin.UserName, dir, store upspin.NetAddr, key upspin.PublicKey) ([]byte, url.Values) {
+	const magic = "signup-request"
+
+	u := url.Values{}
+	h := sha256.New()
+	h.Write([]byte(magic))
+	w := func(key, val string) {
+		var l [4]byte
+		binary.BigEndian.PutUint32(l[:], uint32(len(val)))
+		h.Write(l[:])
+		h.Write([]byte(val))
+		u.Add(key, val)
+	}
+	w("name", string(name))
+	w("dir", string(dir))
+	w("store", string(store))
+	w("key", string(key))
+	return h.Sum(nil), u
 }

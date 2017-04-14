@@ -71,9 +71,19 @@ func (t *Tree) Watch(p path.Parsed, order int64, done <-chan struct{}) (<-chan *
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	// Watch can watch non-existent files, but not non-existent roots.
+	// Therefore, we ensure the root exists before we proceed.
+	err := t.loadRoot()
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
 	// Clone the logs so we can keep reading it while the current tree
 	// continues to be updated (we're about to unlock this tree).
 	cLog, err := t.log.Clone()
+	if errors.Match(errors.E(errors.NotExist), err) {
+		return nil, errors.E(op, errors.NotExist, errors.Str("no root for user"))
+	}
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
@@ -102,6 +112,9 @@ func (t *Tree) Watch(p path.Parsed, order int64, done <-chan struct{}) (<-chan *
 		// Make a copy of the tree so we have an immutable tree in
 		// memory, at a fixed log position.
 		cIndex, err := t.logIndex.Clone()
+		if errors.Match(errors.E(errors.NotExist), err) {
+			return nil, errors.E(op, errors.NotExist, errors.Str("no root for user"))
+		}
 		if err != nil {
 			return nil, errors.E(op, err)
 		}
@@ -152,6 +165,8 @@ func (t *Tree) addWatcher(p path.Parsed, w *watcher) error {
 func (w *watcher) sendCurrentAndWatch(clone, orig *Tree, p path.Parsed, offset int64) {
 	const op = "dir/server/tree.sendCurrentAndWatch"
 
+	defer clone.Close()
+
 	n, _, err := clone.loadPath(p)
 	if err != nil && !errors.Match(errNotExist, err) {
 		log.Error.Printf("%s: error loading path: %s", op, err)
@@ -167,11 +182,11 @@ func (w *watcher) sendCurrentAndWatch(clone, orig *Tree, p path.Parsed, offset i
 				Op:    Put,
 				Entry: n.entry,
 			}
-			err = w.sendEvent(logEntry, offset)
-			if err != nil {
-				return err
+			err := w.sendEvent(logEntry, offset)
+			if err == errTimeout || err == errClosed {
+				return nil
 			}
-			return nil
+			return err
 		}
 		err = clone.traverse(n, 0, fn)
 		if err != nil {
@@ -260,16 +275,14 @@ func (w *watcher) sendEventFromLog(offset int64) (int64, error) {
 		default:
 		}
 
-		logs, next, err := w.log.ReadAt(1, curr)
+		logEntry, next, err := w.log.ReadAt(curr)
 		if err != nil {
 			return next, errors.E(op, errors.Invalid, errors.Errorf("cannot read log at order %d: %v", curr, err))
 		}
-		if len(logs) != 1 {
-			// End of log.
-			return next, nil
+		if next == curr {
+			return curr, nil
 		}
 		curr = next
-		logEntry := logs[0]
 		path := logEntry.Entry.SignedName
 		if !isPrefixPath(path, w.path) {
 			// Not a log of interest.
@@ -358,7 +371,7 @@ func moveDownWatchers(node, parent *node) {
 	p, _ := path.Parse(node.entry.Name) // err can't happen.
 	for i := 0; i < len(parent.watchers); i++ {
 		w := parent.watchers[i]
-		if w.path.NElem() < p.NElem() || w.path.First(p.NElem()).Path() == p.Path() {
+		if w.path.NElem() < p.NElem() || w.path.First(p.NElem()).Path() != p.Path() {
 			curr++
 			continue
 		}
@@ -390,7 +403,7 @@ func notifyWatchers(watchers []*watcher) {
 	}
 }
 
-// newIsPrefixPath reports whether the path has a pathwise prefix.
+// isPrefixPath reports whether the path has a pathwise prefix.
 func isPrefixPath(name upspin.PathName, prefix path.Parsed) bool {
 	parsed, err := path.Parse(name)
 	if err != nil {

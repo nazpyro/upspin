@@ -7,6 +7,7 @@
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"math/big"
 	"net"
@@ -23,9 +24,6 @@ import (
 	"upspin.io/upspin"
 	"upspin.io/user"
 	"upspin.io/valid"
-
-	// We use GCS as the backing for our data.
-	_ "upspin.io/cloud/storage/gcs"
 )
 
 // New initializes an instance of the key service.
@@ -203,6 +201,10 @@ func (s *server) Put(u *upspin.User) error {
 	err = s.putUserEntry(op, entry)
 	sp.End()
 	if err != nil {
+		// Clear out both negative and positive caches on error since we are not certain
+		// about the remote storage state.
+		s.negCache.Remove(u.Name)
+		s.cache.Remove(u.Name)
 		return err
 	}
 
@@ -310,7 +312,7 @@ func (s *server) verifyOwns(u upspin.UserName, pubKey upspin.PublicKey, domain s
 	if err != nil {
 		return errors.E(errors.IO, err)
 	}
-	lastErr := errors.Str("not an administrator")
+	lastErr := errors.Errorf("not an administrator for %s", domain)
 	const prefix = "upspin:"
 	for _, txt := range txts {
 		if len(txt) < len(prefix)+20 {
@@ -340,12 +342,13 @@ func (s *server) verifyOwns(u upspin.UserName, pubKey upspin.PublicKey, domain s
 		sig.S = &ss
 
 		log.Debug.Printf("Verifying if %q owns %q with pubKey: %q. Got sig: %q", u, domain, pubKey, txt[len(prefix):])
-		msg := "upspin-domain:" + domain + "-" + string(u)
-		lastErr = factotum.Verify([]byte(msg), sig, pubKey)
-		if lastErr == nil {
+		hash := sha256.Sum256([]byte("upspin-domain:" + domain + "-" + string(u)))
+		err := factotum.Verify(hash[:], sig, pubKey)
+		if err == nil {
 			// Success!
 			return nil
 		}
+		lastErr = errors.E(errors.Errorf("%s: verifying ownership of domain %s; re-run cmd/upspin setupdomain?", err, domain))
 	}
 	return lastErr
 }

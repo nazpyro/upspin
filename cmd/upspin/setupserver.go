@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -53,7 +54,7 @@ The calling user must be the same one that ran 'upspin setupdomain'.
 		fs.Usage()
 	}
 
-	cfgPath := filepath.Join(*where, *domain)
+	cfgPath := filepath.Join(subcmd.Tilde(*where), *domain)
 	cfg := s.ReadServerConfig(cfgPath)
 
 	// Stash the provided host name in the server config file.
@@ -85,14 +86,14 @@ The calling user must be the same one that ran 'upspin setupdomain'.
 	if err == nil {
 		// TODO(adg): compare local and remote for discrepancies.
 		_ = remote
-		fmt.Printf("User %q already exists on key server.\n", cfg.User)
+		fmt.Fprintf(os.Stderr, "User %q already exists on key server.\n", cfg.User)
 	} else {
 		if err := key.Put(local); err != nil {
 			// TODO(adg): Check whether the TXT record for this
 			// domain is in place.
 			s.Exit(err)
 		}
-		fmt.Printf("Successfully put %q to the key server.\n", cfg.User)
+		fmt.Fprintf(os.Stderr, "Successfully put %q to the key server.\n", cfg.User)
 	}
 
 	// Create Writers file.
@@ -126,24 +127,46 @@ The calling user must be the same one that ran 'upspin setupdomain'.
 		s.Exit(err)
 	}
 
+	// If Bucket is set, look for the old style serviceaccount.json
+	// file, stuff it into the StoreConfig field, clear the
+	// Bucket field, and rewrite the config.
+	// TODO(adg): remove this at the same time as removing the Bucket field.
+	if cfg.Bucket != "" {
+		serviceFile := filepath.Join(cfgPath, "serviceaccount.json")
+		b, err := ioutil.ReadFile(serviceFile)
+		if err != nil {
+			s.Exitf("Bucket set, but: %v", err)
+		}
+		privateKeyData := base64.StdEncoding.EncodeToString(b)
+		cfg.StoreConfig = []string{
+			"backend=GCS",
+			"defaultACL=publicRead",
+			"gcpBucketName=" + cfg.Bucket,
+			"privateKeyData=" + privateKeyData,
+		}
+		cfg.Bucket = ""
+		s.WriteServerConfig(cfgPath, cfg)
+		os.Remove(serviceFile)
+	}
+
 	// Put server config to the remote upspinserver.
 	s.configureServer(cfgPath, cfg)
-	fmt.Printf("Configured upspinserver at %q.\n", cfg.Addr)
+	fmt.Fprintf(os.Stderr, "Configured upspinserver at %q.\n", cfg.Addr)
 
 	// Check that the current configuration points to our new server.
 	// If not, ask the user to change it and update the key server.
 	if s.Config.DirEndpoint() != ep || s.Config.StoreEndpoint() != ep {
-		fmt.Printf("Your current configuration in %q has these values:\n", flags.Config)
-		fmt.Printf("\tdirserver: %v\n\tstoreserver: %v\n\n", s.Config.DirEndpoint(), s.Config.StoreEndpoint())
-		fmt.Printf("To use the server we are setting up now, these values should be\n")
-		fmt.Printf("\tdirserver: %v\n\tstoreserver: %v\n\n", ep, ep)
+		fmt.Fprintf(os.Stderr, "Your current configuration in %q has these values:\n", flags.Config)
+		fmt.Fprintf(os.Stderr, "\tdirserver: %v\n\tstoreserver: %v\n\n", s.Config.DirEndpoint(), s.Config.StoreEndpoint())
+		fmt.Fprintf(os.Stderr, "To use the server we are setting up now, these values should be\n")
+		fmt.Fprintf(os.Stderr, "\tdirserver: %v\n\tstoreserver: %v\n\n", ep, ep)
 		return
 	}
 
 	// Make the current user root.
 	root := string(s.Config.UserName())
 	s.mkdir(root)
-	fmt.Printf("Created root %q.\n", root)
+	fmt.Fprintf(os.Stderr, "Created root %q.\n", root)
 }
 
 func userFor(cfgPath string, cfg *subcmd.ServerConfig) (*upspin.User, error) {
@@ -165,11 +188,8 @@ func userFor(cfgPath string, cfg *subcmd.ServerConfig) (*upspin.User, error) {
 
 func (s *State) configureServer(cfgPath string, cfg *subcmd.ServerConfig) {
 	files := map[string][]byte{}
-	for _, name := range subcmd.ConfigureServerFiles {
+	for _, name := range subcmd.SetupServerFiles {
 		b, err := ioutil.ReadFile(filepath.Join(cfgPath, name))
-		if os.IsNotExist(err) && subcmd.OptionalConfigureServerFiles[name] {
-			continue
-		}
 		if err != nil {
 			s.Exit(err)
 		}

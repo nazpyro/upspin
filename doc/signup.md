@@ -76,7 +76,20 @@ the confirmation link that it contains.
 Visiting that link proves to the key server that you control the email address
 that you are registering and completes the signup process.
 
-Here is the first step.
+You may use your regular email address or an
+Upspin-specific one; either way is fine.
+The address is published in key server logs as well as in any Upspin
+path name you share, so be sure your email account has whatever
+spam, anonymity, or other protection you feel is necessary.
+
+No email will be sent to the address after this signup step.
+All future Upspin operations, even updating later to a new key pair,
+will be validated exclusively with the key pair generated during signup.
+Someone with future access to your email can't masquerade as you in Upspin.
+Conversely, if you lose your keys even your email account is not enough
+for recovery.
+
+Here is the first step in more detail.
 Run this shell command, substituting your email address and directory and store
 servers:
 
@@ -128,6 +141,13 @@ the key server will provide a copy of your public key to any Upspin user that
 requests it.
 (Your public key is needed for securing and sharing Upspin files, and it's safe
 to share.)
+
+**Pay attention to the text in the output about remembering your "secret seed".
+It provides a way to regenerate your keys if you lose them.**
+
+_Note: If used interactively with a shell that keeps a command history, the
+using `keygen` with the `-secretseed` option may cause the secret to be saved in the history file.
+If so, the history file should be cleared after running `keygen`._
 
 
 ## Creating your Upspin directory

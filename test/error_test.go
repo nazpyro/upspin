@@ -204,6 +204,17 @@ func testGetLinkErrors(t *testing.T, r *testenv.Runner) {
 	if !r.Match(errors.E(errors.Permission, upspin.PathName(file))) {
 		t.Fatal(r.Diag())
 	}
+
+	// Add list permission to reader and delete the target.
+	// Accessing the link should fail with a 'BrokenLink' error naming the link.
+	r.As(ownerName)
+	r.Put(dstAccess, "delete:"+ownerName+"\nlist:"+readerName)
+	r.Delete(file)
+	r.As(readerName)
+	r.Get(link)
+	if !r.Match(errors.E(errors.BrokenLink, upspin.PathName(link))) {
+		t.Fatal(r.Diag())
+	}
 }
 
 func testPutErrors(t *testing.T, r *testenv.Runner) {
@@ -1043,7 +1054,6 @@ func testGlobLinkErrors(t *testing.T, r *testenv.Runner) {
 	}
 }
 
-// TODO: delete through links.
 func testDeleteErrors(t *testing.T, r *testenv.Runner) {
 	const (
 		base                    = ownerName + "/delete-errors"
@@ -1122,7 +1132,9 @@ func testDeleteErrors(t *testing.T, r *testenv.Runner) {
 
 	// Owner can delete his own Access file and remaining entries.
 	r.Delete(accessFile)
-	r.Delete(fileInDir)
+	// Even through a link.
+	r.PutLink(dir, base+"/link-to-dir")
+	r.Delete(base + "/link-to-dir/fileInDir")
 	r.Delete(dir)
 	if r.Failed() {
 		t.Fatal(r.Diag())

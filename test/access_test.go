@@ -562,9 +562,9 @@ func testWriteReadAllAccessFile(t *testing.T, r *testenv.Runner) {
 		base             = ownerName + "/readall-access"
 		accessFile       = base + "/Access"
 		file             = base + "/file"
-		subDir           = ownerName + "/dir"
+		subDir           = base + "/dir"
 		subDirAccessFile = subDir + "/Access"
-		subDirFile       = subDir + "/suvfile"
+		subDirFile       = subDir + "/subfile"
 	)
 
 	const (
@@ -582,7 +582,7 @@ func testWriteReadAllAccessFile(t *testing.T, r *testenv.Runner) {
 
 	cleanSubDir := func() {
 		r.Delete(subDirAccessFile)
-		r.Delete(subDirFile)
+		r.Delete(subDir)
 		if r.Failed() {
 			t.Fatal(r.Diag())
 		}
@@ -609,7 +609,6 @@ func testWriteReadAllAccessFile(t *testing.T, r *testenv.Runner) {
 	}
 
 	// Cannot add read:all Access if file exists.
-	cleanBase()
 	r.Put(file, "text")
 	r.Put(accessFile, readAll)
 	if !r.Failed() {
@@ -618,7 +617,6 @@ func testWriteReadAllAccessFile(t *testing.T, r *testenv.Runner) {
 	}
 
 	// OK to add read:all in subdirectory if files exist in parent.
-	cleanBase()
 	r.Put(accessFile, readAllPlusOwner)
 	r.Put(file, "text")
 	r.MakeDirectory(subDir)

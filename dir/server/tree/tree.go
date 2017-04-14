@@ -10,6 +10,7 @@ package tree
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"sort"
 	"sync"
 
@@ -419,7 +420,7 @@ func (t *Tree) loadKids(parent *node) error {
 	if err != nil {
 		return err
 	}
-	err = t.loadKidsFromBlock(parent, data)
+	err = loadKidsFromBlock(parent, data)
 	if err != nil {
 		return err
 	}
@@ -713,9 +714,19 @@ func (t *Tree) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	err := t.flush()
-	if err != nil {
-		return errors.E(op, err)
+	var firstErr error
+	check := func(err error) {
+		if err != nil && firstErr != nil {
+			firstErr = err
+		}
+	}
+
+	check(t.flush())
+	check(t.log.Close())
+	check(t.logIndex.Close())
+
+	if firstErr != nil {
+		return errors.E(op, firstErr)
 	}
 
 	return nil
@@ -724,10 +735,7 @@ func (t *Tree) Close() error {
 // recoverFromLog inspects the LogIndex and the Log and replays the missing
 // operations. It can only be called from New.
 func (t *Tree) recoverFromLog() error {
-	const (
-		op        = "dir/server/tree.recoverFromLog"
-		batchSize = 10 // max number of entries to recover at a time.
-	)
+	const op = "dir/server/tree.recoverFromLog"
 	lastOffset := t.log.LastOffset()
 	lastProcessed, err := t.logIndex.ReadOffset()
 	if err != nil {
@@ -743,61 +751,49 @@ func (t *Tree) recoverFromLog() error {
 		return errors.E(op, err)
 	}
 
-	// Tree is not current. Replay all entries from the log. Read in chunks
-	// of batchSizes entries at a time (a balance between efficiency and
-	// how long we want to process the log without checkpointing our state).
+	// Tree is not current. Replay all entries from the log.
 	recovered := 0
-	next := lastProcessed
-	hadError := false
+	curr := lastProcessed
 	for {
-		log.Debug.Printf("%s: Recovering from log...", op)
-		var replay []LogEntry
-		replay, next, err = t.log.ReadAt(batchSize, next)
+		log.Debug.Printf("%s: Recovering from log... %d", op, curr)
+		logEntry, next, err := t.log.ReadAt(curr)
 		if err != nil {
-			log.Error.Printf("%s: Error in log recovery, possible data loss at offset %d: %s", op, next, err)
-			err = t.logIndex.SaveOffset(lastProcessed)
+			log.Error.Printf("%s: Error in log recovery, possible data loss at offset %d: %s", op, lastProcessed, err)
+			err = t.log.Truncate(curr)
 			if err != nil {
 				return errors.E(op, err)
 			}
-			err = t.log.Truncate(next)
-			if err != nil {
-				return errors.E(op, err)
-			}
-			hadError = true
+			return nil
 		}
-		for _, logEntry := range replay {
-			de := logEntry.Entry
-
-			p, err := path.Parse(de.Name)
-			if err != nil {
-				// We don't expect this to fail because
-				// de.Name was in the log already and thus
-				// has been validated.
-				return errors.E(op, err)
-			}
-
-			switch logEntry.Op {
-			case Put:
-				log.Debug.Printf("%s: Putting dirEntry: %q", op, de.Name)
-				_, _, err = t.put(p, &de)
-			case Delete:
-				log.Debug.Printf("%s: Deleting path: %q", op, p.Path())
-				_, _, err = t.delete(p)
-			default:
-				return errors.E(op, errors.Internal, errors.Errorf("no such log operation: %v", logEntry.Op))
-			}
-			if err != nil {
-				// Now we're in serious trouble. We can't recover.
-				return errors.E(op, t.user, errors.Errorf("can't recover log: %v", err))
-			}
-		}
-		recovered += len(replay)
-		if len(replay) < batchSize {
+		if next == curr {
 			break
 		}
-		if hadError {
-			break
+
+		de := logEntry.Entry
+		p, err := path.Parse(de.Name)
+		if err != nil {
+			// We don't expect this to fail because
+			// de.Name was in the log already and thus
+			// has been validated.
+			return errors.E(op, err)
 		}
+
+		switch logEntry.Op {
+		case Put:
+			log.Debug.Printf("%s: Putting dirEntry: %q", op, de.Name)
+			_, _, err = t.put(p, &de)
+		case Delete:
+			log.Debug.Printf("%s: Deleting path: %q", op, p.Path())
+			_, _, err = t.delete(p)
+		default:
+			return errors.E(op, errors.Internal, errors.Errorf("no such log operation: %v", logEntry.Op))
+		}
+		if err != nil {
+			// Now we're in serious trouble. We can't recover.
+			return errors.E(op, t.user, errors.Errorf("can't recover log: %v", err))
+		}
+		recovered++
+		curr = next
 	}
 	log.Debug.Printf("%s: %d entries recovered. Tree is current.", op, recovered)
 	log.Debug.Printf("%s: Tree:\n%s\n", op, t)
@@ -808,10 +804,19 @@ func (t *Tree) recoverFromLog() error {
 func (t *Tree) OnEviction(key interface{}) {
 	const op = "dir/server/tree.OnEviction"
 	log.Debug.Printf("%s: tree being evicted: %s", op, t.log.User())
+	// We do not call t.Close here because we can't be sure the DirServer
+	// is done using us. But because this is likely our last chance to clean
+	// up, we set a finalizer.
 	err := t.Flush()
 	if err != nil {
 		log.Error.Printf("%s: flush: %v", op, err)
 	}
+	runtime.SetFinalizer(t, func(t *Tree) {
+		err := t.Close()
+		if err != nil {
+			log.Error.Printf("%s: finalizing tree: %s", op, err)
+		}
+	})
 }
 
 // String implements fmt.Stringer.

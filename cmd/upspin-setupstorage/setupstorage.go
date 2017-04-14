@@ -9,15 +9,14 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 
 	"golang.org/x/oauth2/google"
+	"google.golang.org/api/googleapi"
 	iam "google.golang.org/api/iam/v1"
 	storage "google.golang.org/api/storage/v1"
 
@@ -53,6 +52,8 @@ Authenticate and enable the necessary APIs:
 	$ gcloud --project <project> beta service-management enable iam.googleapis.com storage_api
 And, finally, authenticate again in a different way:
 	$ gcloud auth application-default login
+
+Running this command when the service account or bucket exists is a no-op.
 `
 
 func main() {
@@ -68,7 +69,7 @@ func main() {
 	where := flag.String("where", filepath.Join(os.Getenv("HOME"), "upspin", "deploy"), "`directory` to store private configuration files")
 	domain := flag.String("domain", "", "domain `name` for this Upspin installation")
 
-	flags.Register() // enable all global flags
+	flags.Register("project")
 
 	s.ParseFlags(flag.CommandLine, os.Args[1:], help,
 		"-project=<gcp_project_name> setupstorage -domain=<name> <bucket_name>")
@@ -84,22 +85,24 @@ func main() {
 	cfgPath := filepath.Join(*where, *domain)
 	cfg := s.ReadServerConfig(cfgPath)
 
-	email := s.createServiceAccount(cfgPath)
-	fmt.Printf("Service account %q created.\n", email)
+	email, privateKeyData := s.createServiceAccount(cfgPath)
 
 	s.createBucket(email, bucket)
-	fmt.Printf("Bucket %q created.\n", bucket)
 
-	cfg.Bucket = bucket
+	cfg.StoreConfig = []string{
+		"backend=GCS",
+		"defaultACL=publicRead",
+		"gcpBucketName=" + bucket,
+		"privateKeyData=" + privateKeyData,
+	}
 	s.WriteServerConfig(cfgPath, cfg)
 
-	fmt.Printf("You should now deploy the upspinserver binary and run 'upspin setupserver'.\n")
+	fmt.Fprintf(os.Stderr, "You should now deploy the upspinserver binary and run 'upspin setupserver'.\n")
 
 	s.ExitNow()
 }
 
-func (s *state) createServiceAccount(cfgPath string) (email string) {
-	// TODO(adg): detect that key exists and re-use it
+func (s *state) createServiceAccount(cfgPath string) (email, privateKeyData string) {
 	client, err := google.DefaultClient(context.Background(), iam.CloudPlatformScope)
 	if err != nil {
 		// TODO: ask the user to run 'gcloud auth application-default login'
@@ -110,8 +113,6 @@ func (s *state) createServiceAccount(cfgPath string) (email string) {
 		s.Exit(err)
 	}
 
-	// TODO(adg): detect that the account exists
-	// and decide what to do in that case
 	name := "projects/" + flags.Project
 	req := &iam.CreateServiceAccountRequest{
 		AccountId: "upspinstorage", // TODO(adg): flag?
@@ -119,8 +120,18 @@ func (s *state) createServiceAccount(cfgPath string) (email string) {
 			DisplayName: "Upspin Storage",
 		},
 	}
+	created := true
 	acct, err := svc.Projects.ServiceAccounts.Create(name, req).Do()
-	if err != nil {
+	if isExists(err) {
+		// This should be the name we need to get.
+		// TODO(adg): make this more robust by listing instead.
+		guess := name + "/serviceAccounts/upspinstorage@" + flags.Project + ".iam.gserviceaccount.com"
+		acct, err = svc.Projects.ServiceAccounts.Get(guess).Do()
+		if err != nil {
+			s.Exit(err)
+		}
+		created = false
+	} else if err != nil {
 		s.Exit(err)
 	}
 
@@ -130,17 +141,13 @@ func (s *state) createServiceAccount(cfgPath string) (email string) {
 	if err != nil {
 		s.Exit(err)
 	}
-
-	b, err := base64.StdEncoding.DecodeString(key.PrivateKeyData)
-	if err != nil {
-		s.Exit(err)
-	}
-	err = ioutil.WriteFile(filepath.Join(cfgPath, "serviceaccount.json"), b, 0600)
-	if err != nil {
-		s.Exit(err)
+	if created {
+		fmt.Fprintf(os.Stderr, "Service account %q created.\n", acct.Email)
+	} else {
+		fmt.Fprintf(os.Stderr, "A new key for the service account %q was created.\n", acct.Email)
 	}
 
-	return acct.Email
+	return acct.Email, key.PrivateKeyData
 }
 
 func (s *state) createBucket(email, bucket string) {
@@ -164,7 +171,27 @@ func (s *state) createBucket(email, bucket string) {
 		Name: bucket,
 		// TODO(adg): flag for location
 	}).Do()
-	if err != nil {
+	if isExists(err) {
+		// TODO(adg): update bucket ACL to make sure the service
+		// account has access. (For now, we assume that the user
+		// created the bucket using this command and that the bucket
+		// has the correct permissions.)
+		fmt.Fprintf(os.Stderr, "Bucket %q already exists; re-using it.\n", bucket)
+	} else if err != nil {
 		s.Exit(err)
+	} else {
+		fmt.Fprintf(os.Stderr, "Bucket %q created.\n", bucket)
 	}
+}
+
+func isExists(err error) bool {
+	if e, ok := err.(*googleapi.Error); ok && len(e.Errors) > 0 {
+		for _, e := range e.Errors {
+			if e.Reason != "alreadyExists" && e.Reason != "conflict" {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }

@@ -9,19 +9,21 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"reflect"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"upspin.io/errors"
 	"upspin.io/upspin"
 )
 
-var user upspin.UserName = "foo@bar.com"
-
-func TestMarshalUnmarshal(t *testing.T) {
-	entry := LogEntry{
+var (
+	user  upspin.UserName = "foo@bar.com"
+	entry                 = LogEntry{
 		Op: Delete,
 		Entry: upspin.DirEntry{
 			Name:       "foo@bar.com/dir/file.txt",
@@ -34,6 +36,9 @@ func TestMarshalUnmarshal(t *testing.T) {
 			Time:       1234567890,
 		},
 	}
+)
+
+func TestMarshalUnmarshal(t *testing.T) {
 	buf, err := entry.marshal()
 	if err != nil {
 		t.Fatal(err)
@@ -48,6 +53,116 @@ func TestMarshalUnmarshal(t *testing.T) {
 	if !reflect.DeepEqual(&entry, &newEntry) {
 		t.Errorf("newEntry = %v, want = %v", newEntry, entry)
 	}
+}
+
+func TestConcurrent(t *testing.T) {
+	const (
+		numWriters = 3
+		numReaders = 2
+		numEntries = 100
+	)
+	if testing.Short() {
+		// To run faster, run the log on a ram disk:
+		// mkdir /dev/shm/test
+		// env TMPDIR=/dev/shm/test go test -run=Concurrent
+		t.Skip("Concurrent test takes too long")
+	}
+	dir, err := ioutil.TempDir("", "TestConcurrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	logRW, _, err := NewLogs(user, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logRW.Close()
+	var done sync.WaitGroup
+	start := make(chan struct{})
+	aborting := int32(0) // if positive, indicates a fatal and all must quit.
+	abort := func() { atomic.StoreInt32(&aborting, 1) }
+	aborted := func() bool { return atomic.LoadInt32(&aborting) == 1 }
+	write := func() {
+		defer done.Done()
+		<-start
+		for i := 0; i < numEntries; i++ {
+			e := entry
+			e.Entry.Sequence = upspin.NewSequence()
+			e.Entry.Time = upspin.Now()
+			if rand.Intn(10) == 0 {
+				e.Entry.SignedName = "bar@foo.com/otherfile"
+			}
+			if rand.Intn(10) == 0 {
+				e.Entry.Link = "hello@example.com/subdir/file"
+			}
+			if rand.Intn(5) == 0 {
+				e.Entry.Writer = "meh@yo.com"
+			}
+			numBlocks := rand.Intn(20)
+			var offs int64
+			for b := 0; b < numBlocks; b++ {
+				packSize := rand.Intn(3000)
+				packdata := make([]byte, packSize)
+				_, err := rand.Read(packdata)
+				if err != nil {
+					abort()
+					t.Fatal(err)
+				}
+				size := rand.Int63n(1000)
+				block := upspin.DirBlock{
+					Offset:   offs,
+					Size:     size,
+					Packdata: packdata,
+				}
+				offs += size
+				e.Entry.Blocks = append(e.Entry.Blocks, block)
+			}
+			if aborted() {
+				return
+			}
+			err := logRW.Append(&e)
+			if err != nil {
+				abort()
+				t.Fatal(err)
+			}
+		}
+	}
+	read := func() {
+		defer done.Done()
+		logRO, err := logRW.Clone()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer logRO.Close()
+		<-start
+		var offset int64
+		for i := 0; i < numEntries*numWriters; i++ {
+			if aborted() {
+				return
+			}
+			_, next, err := logRO.ReadAt(offset)
+			if err != nil {
+				abort()
+				t.Fatal(err)
+			}
+			if offset == next {
+				i--
+				continue
+			}
+			offset = next
+		}
+	}
+
+	done.Add(numWriters + numReaders)
+	for i := 0; i < numWriters; i++ {
+		go write()
+	}
+	for i := 0; i < numReaders; i++ {
+		go read()
+	}
+	close(start)
+	done.Wait()
 }
 
 func TestAppendRead(t *testing.T) {
@@ -67,7 +182,7 @@ func TestAppendRead(t *testing.T) {
 	}
 
 	for i := 0; i < 10; i++ {
-		le := newLogEntry(upspin.PathName(fmt.Sprintf("foo@bar.com/hello%d", i)))
+		le := newLogEntry(upspin.PathName(fmt.Sprintf("foo@bar.com/hello%d", i)), i+1)
 		err := logger.Append(le)
 		if err != nil {
 			t.Fatal(err)
@@ -77,37 +192,33 @@ func TestAppendRead(t *testing.T) {
 	if got, wantAtLeast := logger.LastOffset(), int64(minEntrySize*10); got < wantAtLeast {
 		t.Errorf("LastOffset = %d, want > %d", got, wantAtLeast)
 	}
-	// Read LogEntries back in two passes.
-	entries, nextOffset, err := logger.ReadAt(6, 0)
-	if err != nil {
-		t.Fatal(err)
+	// Read LogEntries back.
+	var entries []LogEntry
+	offset := int64(0)
+	for i := 0; i < 11; i++ { // Tries to go past EOF.
+		entry, next, err := logger.ReadAt(offset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next == offset {
+			break
+		}
+		offset = next
+		entries = append(entries, entry)
 	}
-	if got, want := len(entries), 6; got != want {
-		t.Fatalf("len(entries) = %d, want = %d", got, want)
-	}
-	if wantAtLeast := int64(minEntrySize * 6); nextOffset < wantAtLeast {
-		t.Errorf("nextOffset = %d, want > %d", nextOffset, wantAtLeast)
-	}
-	// Read more. Attempt to go past the EOF
-	entries, nextOffset, err = logger.ReadAt(32, nextOffset)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := len(entries), 4; got != want { // 4 remaining entries.
-		t.Fatalf("len(entries) = %d, want = %d", got, want)
-	}
-	if want := logger.LastOffset(); nextOffset != want {
-		t.Errorf("nextOffset = %d, want = %d", nextOffset, want)
+
+	if want := logger.LastOffset(); offset != want {
+		t.Errorf("nextOffset = %d, want = %d", offset, want)
 	}
 	// Spot-check some entries.
-	if got, want := string(entries[0].Entry.Name), "foo@bar.com/hello6"; got != want {
-		t.Errorf("entries[0].Entry.Name = %q, want = %q", got, want)
+	if got, want := string(entries[6].Entry.Name), "foo@bar.com/hello6"; got != want {
+		t.Errorf("entries[6].Entry.Name = %q, want = %q", got, want)
 	}
-	if got, want := entries[0].Op, Put; got != want {
-		t.Errorf("entries[0].Op = %v, want = %v", got, want)
+	if got, want := entries[6].Op, Put; got != want {
+		t.Errorf("entries[6].Op = %v, want = %v", got, want)
 	}
-	if got, want := string(entries[3].Entry.Name), "foo@bar.com/hello9"; got != want {
-		t.Errorf("entries[3].Entry.Name = %q, want = %q", got, want)
+	if got, want := string(entries[9].Entry.Name), "foo@bar.com/hello9"; got != want {
+		t.Errorf("entries[9].Entry.Name = %q, want = %q", got, want)
 	}
 
 	// Clone the log and ensure it's read-only.
@@ -118,14 +229,11 @@ func TestAppendRead(t *testing.T) {
 	if got, want := clone.LastOffset(), logger.LastOffset(); got != want {
 		t.Errorf("LastOffset = %d, want = %d", got, want)
 	}
-	entries, nextOffset, err = clone.ReadAt(1, 0)
+	entry, offset, err = clone.ReadAt(0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := len(entries), 1; got != want {
-		t.Fatalf("len(entries) = %d, want = %d", got, want)
-	}
-	err = clone.Append(newLogEntry(upspin.PathName("foo@bar.com/yabbadabadoo")))
+	err = clone.Append(newLogEntry(upspin.PathName("foo@bar.com/yabbadabadoo"), 17))
 	expectedErr := errors.E(errors.IO)
 	if !errors.Match(expectedErr, err) {
 		t.Errorf("err = %v, want = %v", err, expectedErr)
@@ -281,11 +389,8 @@ func TestChecksum(t *testing.T) {
 	}
 }
 
-var seq int64
-
-func newLogEntry(path upspin.PathName) *LogEntry {
+func newLogEntry(path upspin.PathName, seq int) *LogEntry {
 	var op Operation
-	seq++
 	if seq%2 == 0 {
 		op = Delete
 	} else {
@@ -297,7 +402,7 @@ func newLogEntry(path upspin.PathName) *LogEntry {
 			Name:       path,
 			SignedName: path,
 			Writer:     "foo@bar.com",
-			Sequence:   seq,
+			Sequence:   int64(seq),
 		},
 	}
 }

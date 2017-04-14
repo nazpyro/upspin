@@ -272,8 +272,9 @@ func (l *clog) wipeLog(user upspin.UserName) {
 			continue
 		}
 
-		// Glob requests are obsoleted by obsoleting their children.
+		// Glob requests can be marked as incomplete.
 		if e.request == globReq || e.request == obsoleteReq {
+			e.complete = false
 			continue
 		}
 		e.request = obsoleteReq
@@ -412,7 +413,7 @@ func (l *clog) readLogFile(fn string) error {
 		}
 		switch e.request {
 		case versionReq:
-			log.Info.Printf("%s: verson other than first record", op)
+			log.Info.Printf("%s: version other than first record", op)
 			break
 		case globReq:
 			// Since we first log all the contents of a directory before the glob,
@@ -433,19 +434,6 @@ func (l *clog) readLogFile(fn string) error {
 		}
 	}
 	return nil
-}
-
-func (l *clog) myDirServer(pathName upspin.PathName) bool {
-	name := string(pathName)
-	// Pull off the user name.
-	var userName string
-	slash := strings.IndexByte(name, '/')
-	if slash < 0 {
-		userName = name
-	} else {
-		userName = name[:slash]
-	}
-	return userName == string(l.cfg.UserName())
 }
 
 func (l *clog) close() error {
@@ -594,9 +582,6 @@ func (l *clog) logRequest(op request, name upspin.PathName, err error, de *upspi
 }
 
 func (l *clog) logRequestWithOrder(op request, name upspin.PathName, err error, de *upspin.DirEntry, order int64) {
-	if !l.myDirServer(name) {
-		return
-	}
 	if !cacheableError(err) {
 		return
 	}
@@ -643,9 +628,6 @@ func cacheableGlob(p upspin.PathName) (upspin.PathName, bool) {
 }
 
 func (l *clog) logGlobRequest(pattern upspin.PathName, err error, entries []*upspin.DirEntry) {
-	if !l.myDirServer(pattern) {
-		return
-	}
 	if !cacheableError(err) {
 		return
 	}

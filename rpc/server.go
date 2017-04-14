@@ -209,8 +209,10 @@ func serveStream(s Stream, sess Session, w http.ResponseWriter, body []byte) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	connClosed := w.(http.CloseNotifier).CloseNotify()
 	go func() {
-		<-w.(http.CloseNotifier).CloseNotify()
+		<-connClosed
 		close(done)
 	}()
 
@@ -253,6 +255,7 @@ func serveStream(s Stream, sess Session, w http.ResponseWriter, body []byte) {
 
 func (s *serverImpl) SessionForRequest(w http.ResponseWriter, r *http.Request) (session Session, err error) {
 	const op = "rpc.SessionForRequest"
+
 	defer func() {
 		if err == nil {
 			return
@@ -264,21 +267,30 @@ func (s *serverImpl) SessionForRequest(w http.ResponseWriter, r *http.Request) (
 		// care that this error originated in this function.
 		err = errors.E(op, err)
 	}()
+
 	if tok, ok := r.Header[authTokenHeader]; ok && len(tok) == 1 {
 		return s.validateToken(tok[0])
 	}
+
 	proxyRequest, ok := r.Header[proxyRequestHeader]
 	if ok && len(proxyRequest) != 1 {
 		return nil, errors.E(errors.Invalid, errors.Str("invalid proxy request in header"))
 	}
+
+	// Clients send a single header line with comma-separated values.
 	authRequest, ok := r.Header[authRequestHeader]
-	if ok && len(authRequest) != 5 {
-		return nil, errors.E(errors.Invalid, errors.Str("invalid auth request in header"))
+	if !ok {
+		return nil, errors.E(errors.Invalid, errors.Str("missing auth request header"))
+	} else if len(authRequest) == 5 {
+		// Old-style authentication tokens should now fail,
+		// but provide an informative error message when they do.
+		// TODO(adg): Remove this if/else block on April 15.
+		return nil, errors.E(errors.Invalid, errors.Str("invalid auth request header (please update your Upspin clients and servers)"))
+	} else if len(authRequest) != 1 {
+		return nil, errors.E(errors.Invalid, errors.Str("invalid auth request header"))
 	}
-	if authRequest == nil {
-		log.Printf("%#v", r.Header)
-		return nil, errors.E(errors.Invalid, errors.Str("no auth token or request in header"))
-	}
+	authRequest = strings.Split(authRequest[0], ",")
+
 	return s.handleSessionRequest(w, authRequest, proxyRequest, r.Host)
 }
 

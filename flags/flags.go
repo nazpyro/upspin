@@ -31,51 +31,83 @@ const (
 	defaultServerKind = "inprocess"
 )
 
+// None is the set of no flags. It is rarely needed as most programs
+// use either the Server or Client set.
+var None = []string{}
+
+// Server is the set of flags most useful in servers. It can be passed as the
+// argument to Parse to set up the package for a server.
+var Server = []string{
+	"config", "log", "http", "https", "letscache", "tls", "addr", "insecure",
+}
+
+// Client is the set of flags most useful in clients. It can be passed as the
+// argument to Parse to set up the package for a client.
+var Client = []string{
+	"config", "log", "blocksize", "prudent",
+}
+
+// The Parse and Register functions bind these variables to their respective
+// command-line flags.
 var (
-	// BlockSize is the block size used when writing large files. The default is 1MB.
+	// BlockSize ("blocksize") is the block size used when writing large files.
+	// The default is 1MB.
 	BlockSize = defaultBlockSize
 
-	// CacheDir specifies the directory for the various file caches.
+	// CacheDir ("cachedir") specifies the directory for the various file
+	// caches.
 	defaultCacheDir = filepath.Join(config.Home(), "upspin")
 	CacheDir        = defaultCacheDir
 
-	// Config names the Upspin configuration file to use.
+	// Config ("config") names the Upspin configuration file to use.
 	defaultConfig = filepath.Join(config.Home(), "upspin", "config")
 	Config        = defaultConfig
 
-	// HTTPAddr is the network address on which to listen for incoming
-	// insecure network connections.
+	// HTTPAddr ("http") is the network address on which to listen for
+	// incoming insecure network connections.
 	HTTPAddr = defaultHTTPAddr
 
-	// HTTPSAddr is the network address on which to listen for incoming
-	// secure network connections.
+	// HTTPSAddr ("https") is the network address on which to listen for
+	// incoming secure network connections.
 	HTTPSAddr = defaultHTTPSAddr
 
-	// LetsEncryptCache is the location of a file in which the Let's
-	// Encrypt certificates are stored. The containing directory should
-	// be owner-accessible only (chmod 0700).
+	// InsecureHTTP ("insecure") specifies whether to serve insecure HTTP
+	// on HTTPAddr, instead of serving HTTPS (secured by TLS) on HTTPSAddr.
+	InsecureHTTP = false
+
+	// LetsEncryptCache ("letscache") is the location of a file in which
+	// the Let's Encrypt certificates are stored. The containing directory
+	// should be owner-accessible only (chmod 0700).
 	LetsEncryptCache = ""
 
-	// Log sets the level of logging (implements flag.Value).
+	// Log ("log") sets the level of logging (implements flag.Value).
 	Log logFlag
 
-	// NetAddr is the publicly accessible network address of this server.
+	// NetAddr ("addr") is the publicly accessible network address of this
+	// server.
 	NetAddr = ""
 
-	// Project is the project name on GCP; used by servers, upspin-deploy,
-	// and cmd/upspin setupdomain.
+	// Project ("project") is the project name on GCP; used by servers,
+	// upspin-deploy, and cmd/upspin setupdomain.
 	Project = ""
 
-	// ServerConfig specifies configuration options ("key=value") for servers.
+	// ServerConfig ("serverconfig") specifies configuration options for
+	// servers in "key=value" pairs.
 	ServerConfig []string
 
-	// ServerKind is the implementation kind of this server.
+	// ServerKind ("kind") is the implementation kind of this server.
 	ServerKind = defaultServerKind
 
-	// StoreServerName is the Upspin user name of the StoreServer.
-	StoreServerUser = ""
+	// Prudent ("prudent") sets an extra security mode in the client to
+	// check for malicious or buggy servers, at possible cost in
+	// performance or convenience. Specifically, one check is that the
+	// writer listed in a directory entry is either the owner or a user
+	// currently with write permission. This protects against a forged
+	// directory entry at the cost of potentially blocking a legitimate
+	// file written by a user who no longer has write permission.
+	Prudent = false
 
-	// TLSCertFile and TLSKeyFile specify the location of a TLS
+	// TLSCertFile and TLSKeyFile ("tls") specify the location of a TLS
 	// certificate/key pair used for serving TLS (HTTPS).
 	TLSCertFile = ""
 	TLSKeyFile  = ""
@@ -96,10 +128,21 @@ var flags = map[string]*flagVar{
 			return fmt.Sprintf("-blocksize=%d", BlockSize)
 		},
 	},
-	"cachedir":  strVar(&CacheDir, "cachedir", CacheDir, "`directory` containing all file caches"),
-	"config":    strVar(&Config, "config", Config, "user's configuration `file`"),
-	"http":      strVar(&HTTPAddr, "http", HTTPAddr, "`address` for incoming insecure network connections"),
-	"https":     strVar(&HTTPSAddr, "https", HTTPSAddr, "`address` for incoming secure network connections"),
+	"cachedir": strVar(&CacheDir, "cachedir", CacheDir, "`directory` containing all file caches"),
+	"config":   strVar(&Config, "config", Config, "user's configuration `file`"),
+	"http":     strVar(&HTTPAddr, "http", HTTPAddr, "`address` for incoming insecure network connections"),
+	"https":    strVar(&HTTPSAddr, "https", HTTPSAddr, "`address` for incoming secure network connections"),
+	"insecure": &flagVar{
+		set: func() {
+			flag.BoolVar(&InsecureHTTP, "insecure", false, "whether to serve insecure HTTP instead of HTTPS")
+		},
+		arg: func() string {
+			if InsecureHTTP {
+				return "-insecure"
+			}
+			return ""
+		},
+	},
 	"kind":      strVar(&ServerKind, "kind", ServerKind, "server implementation `kind` (inprocess, gcp)"),
 	"letscache": strVar(&LetsEncryptCache, "letscache", "", "Let's Encrypt cache `directory`"),
 	"log": &flagVar{
@@ -116,7 +159,17 @@ var flags = map[string]*flagVar{
 		},
 		arg: func() string { return strArg("serverconfig", configFlag{&ServerConfig}.String(), "") },
 	},
-	"storeserveruser": strVar(&StoreServerUser, "storeserveruser", "", "user name of the StoreServer"),
+	"prudent": &flagVar{
+		set: func() {
+			flag.BoolVar(&Prudent, "prudent", false, "protect against malicious directory server")
+		},
+		arg: func() string {
+			if !Prudent {
+				return ""
+			}
+			return "-prudent"
+		},
+	},
 	"tls": &flagVar{
 		set: func() {
 			flag.StringVar(&TLSCertFile, "tls_cert", "", "TLS Certificate `file` in PEM format")
@@ -127,20 +180,32 @@ var flags = map[string]*flagVar{
 	},
 }
 
-// Parse registers the command-line flags for the given flag names
-// and calls flag.Parse. Passing zero names registers all flags.
-// Passing an unknown name triggers a panic.
+// Parse registers the command-line flags for the given default flags list, plus
+// any extra flag names, and calls flag.Parse. Passing no flag names in either
+// list registers all flags. Passing an unknown name triggers a panic.
+// The Server and Client variables contain useful default sets.
 //
-// For example:
-// 	flags.Parse("config", "endpoint") // Register Config and Endpoint.
-// or
-// 	flags.Parse() // Register all flags.
-func Parse(names ...string) {
-	Register(names...)
+// Examples:
+// 	flags.Parse(flags.Client) // Register all client flags.
+//	flags.Parse(flags.Server, "cachedir") // Register all server flags plus cachedir.
+// 	flags.Parse(nil) // Register all flags.
+// 	flags.Parse(flags.None, "config", "endpoint") // Register only config and endpoint.
+func Parse(defaultList []string, extras ...string) {
+	if len(defaultList) == 0 && len(extras) == 0 {
+		Register()
+	} else {
+		if len(defaultList) > 0 {
+			Register(defaultList...)
+		}
+		if len(extras) > 0 {
+			Register(extras...)
+		}
+	}
 	flag.Parse()
 }
 
 // Register registers the command-line flags for the given flag names.
+// Unlike Parse, it may be called multiple times.
 // Passing zero names install all flags.
 // Passing an unknown name triggers a panic.
 //

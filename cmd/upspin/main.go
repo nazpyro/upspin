@@ -63,6 +63,9 @@ its -l flag and debugging enabled, run
 
 	upspin -log debug ls -l
 
+As a shorthand, a lone at sign (@) at the beginning of an Upspin path
+stands for the current user's Upspin root.
+
 For a list of available subcommands and global flags, run
 
 	upspin -help
@@ -91,6 +94,7 @@ var commands = map[string]func(*State, ...string){
 	"snapshot":      (*State).snapshot,
 	"tar":           (*State).tar,
 	"user":          (*State).user,
+	"watch":         (*State).watch,
 	"whichaccess":   (*State).whichAccess,
 }
 
@@ -104,7 +108,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("upspin: ")
 	flag.Usage = usage
-	flags.Parse() // enable all flags
+	flags.Parse(flags.Client)
 
 	if len(flag.Args()) < 1 {
 		fmt.Fprintln(os.Stderr, intro)
@@ -183,9 +187,8 @@ func (s *State) getCommand(op string) func(*State, ...string) {
 			s.runCommand(path, append(flags.Args(), args...)...)
 		}
 	}
-	fmt.Fprintf(os.Stderr, "upspin: no such command %q\n", op)
 	printCommands()
-	os.Exit(2)
+	s.Exitf("no such command %q", op)
 	return nil
 }
 

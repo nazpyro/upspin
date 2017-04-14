@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"upspin.io/errors"
+	"upspin.io/path"
 	"upspin.io/upspin"
 )
 
@@ -306,6 +307,20 @@ func TestWatchNonExistingNode(t *testing.T) {
 	}
 }
 
+func TestCannotWatchNonExistentRoot(t *testing.T) {
+	config, log, logIndex := newConfigForTesting(t, userName)
+	tree, err := New(config, log, logIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Get a watcher for the current subtree, rooted at orig/sub1.
+	done := make(chan struct{})
+	_, err = tree.Watch(mkpath(t, userName+"/orig/sub1"), -1, done)
+	if !errors.Match(errNotExist, err) {
+		t.Fatalf("Expected NotExist, got = %v", err)
+	}
+}
+
 // Tests internal functionality that can be tricky.
 func TestRemoveDeadWatchers(t *testing.T) {
 	d := make(chan struct{})
@@ -347,6 +362,43 @@ func TestRemoveDeadWatchers(t *testing.T) {
 		// Verify that only the expected number of open watchers remain.
 		if got, want := len(n.watchers), tc.open; got != want {
 			t.Fatalf("%d: open = %d, want = %d", i, got, want)
+		}
+	}
+}
+
+func TestMoveDownWatchers(t *testing.T) {
+	wp, err := path.Parse("foo@bar.com/p/n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		node   *node
+		parent *node
+		moved  bool
+	}{
+		{
+			node: &node{entry: upspin.DirEntry{Name: "foo@bar.com/p/n1"}},
+			parent: &node{
+				entry:    upspin.DirEntry{Name: "foo@bar.com/p/"},
+				watchers: []*watcher{&watcher{path: wp}},
+			},
+			moved: true,
+		},
+		{
+			node: &node{entry: upspin.DirEntry{Name: "foo@bar.com/p/n111"}},
+			parent: &node{
+				entry:    upspin.DirEntry{Name: "foo@bar.com/p/"},
+				watchers: []*watcher{&watcher{path: wp}},
+			},
+			moved: false,
+		},
+	}
+
+	for i, test := range tests {
+		moveDownWatchers(test.node, test.parent)
+		if moved := len(test.node.watchers) == 1; moved != test.moved {
+			t.Errorf("#%d: moved = %v, want %v", i, moved, test.moved)
 		}
 	}
 }

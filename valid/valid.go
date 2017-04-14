@@ -69,11 +69,11 @@ func validPathName(name upspin.PathName) error {
 }
 
 // DirBlock verifies that the block is valid, that is, that it has a
-// non-negative Size, non-negative Offset, and valid Location.
+// greater-than-zero Size, non-negative Offset, and valid Location.
 func DirBlock(block upspin.DirBlock) error {
 	const op = "valid.DirBlock"
-	if block.Size < 0 { // TODO: This should be <= 0 but dir/inprocess creates empty blocks.
-		return errors.E(op, errors.Invalid, errors.Errorf("negative block size %d", block.Size))
+	if block.Size <= 0 {
+		return errors.E(op, errors.Invalid, errors.Errorf("non-positive block size %d", block.Size))
 	}
 	if block.Offset < 0 {
 		return errors.E(op, errors.Invalid, errors.Errorf("negative block offset %d", block.Offset))
@@ -120,6 +120,7 @@ func Endpoint(endpoint upspin.Endpoint) error {
 // - Attr must not include AttrIncomplete
 // - Packing must be known
 // - Sequence must have a known special value or be non-negative
+// - for non-directory entries, a Writer field is required.
 func DirEntry(entry *upspin.DirEntry) error {
 	const op = "valid.DirEntry"
 	// SignedName must be good.
@@ -185,6 +186,13 @@ func DirEntry(entry *upspin.DirEntry) error {
 		if err := DirBlock(block); err != nil {
 			return errors.E(op, errors.Invalid, entry.Name, err)
 		}
+	}
+	// For non-directory entries, a Writer field is required.
+	if entry.IsDir() {
+		return nil
+	}
+	if err := UserName(entry.Writer); err != nil {
+		return errors.E(op, errors.Str("invalid writer"), err)
 	}
 	return nil
 }

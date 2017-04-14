@@ -60,6 +60,11 @@ var Separator = ":\n\t"
 type Kind uint8
 
 // Kinds of errors.
+//
+// The values of the error kinds are common between both
+// clients and servers. Do not reorder this list or remove
+// any items since that will change their values.
+// New items must be added only to the end.
 const (
 	Other         Kind = iota // Unclassified error. This value is not printed in the error message.
 	Invalid                   // Invalid operation for this type of item.
@@ -74,6 +79,7 @@ const (
 	Internal                  // Internal error or inconsistency.
 	CannotDecrypt             // No wrapped key for user with read access.
 	Transient                 // A transient error.
+	BrokenLink                // Link target does not exist.
 )
 
 func (k Kind) String() string {
@@ -90,6 +96,8 @@ func (k Kind) String() string {
 		return "item already exists"
 	case NotExist:
 		return "item does not exist"
+	case BrokenLink:
+		return "link target does not exist"
 	case IsDir:
 		return "item is a directory"
 	case NotDir:

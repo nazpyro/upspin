@@ -153,6 +153,7 @@ func (s *State) shareCommand(fs *flag.FlagSet) {
 	}
 
 	var entriesToFix []*upspin.DirEntry
+	printedDiscrepancyHeader := true
 
 	// Identify the entries we need to update.
 	for _, entry := range entries {
@@ -186,13 +187,14 @@ func (s *State) shareCommand(fs *flag.FlagSet) {
 		}
 		userList := userListToString(users)
 		if userList != keyUsers || self {
-			if !s.sharer.quiet {
-				if len(entriesToFix) == 0 {
-					fmt.Println("\nAccess discrepancies:")
+			if !s.sharer.quiet || !s.sharer.fix {
+				if !printedDiscrepancyHeader {
+					fmt.Fprintln(os.Stderr, "\nDiscrepancies between users in Access files and users in wrapped keys:")
+					printedDiscrepancyHeader = true
 				}
-				fmt.Printf("\n%s:\n", entry.Name)
-				fmt.Printf("\tAccess: %s\n", userList)
-				fmt.Printf("\tKeys:   %s\n", keyUsers)
+				fmt.Fprintf(os.Stderr, "\n%s:\n", entry.Name)
+				fmt.Fprintf(os.Stderr, "\tAccess: %s\n", userList)
+				fmt.Fprintf(os.Stderr, "\tKeys:   %s\n", keyUsers)
 			}
 			entriesToFix = append(entriesToFix, entry)
 		}
@@ -263,6 +265,10 @@ func (s *Sharer) readers(entry *upspin.DirEntry) ([]upspin.UserName, string, boo
 					self = true
 				}
 			}
+			if !ok && s.fix {
+				ok = true
+				thisUser = "unknown"
+			}
 			if !ok && !unknownUser {
 				// We have a key but no user with that key is known to us.
 				// This means an access change has removed permissions for some user
@@ -294,9 +300,12 @@ func userListToString(userList []upspin.UserName) string {
 }
 
 // allEntries expands the arguments to find all the DirEntries identifying items to examine.
+// The returned slice contains no directories and no links, only plain files.
 func (s *Sharer) allEntries(names []upspin.PathName) []*upspin.DirEntry {
 	var entries []*upspin.DirEntry
-	// We will not follow links; don't use Client. Use the directory server directly.
+	// We will not follow links past this point; don't use Client.
+	// Use the directory server directly.
+	// Glob has processed the higher-level links to get us here.
 	for _, name := range names {
 		entry, err := s.state.DirServer(name).Lookup(name)
 		if err != nil {

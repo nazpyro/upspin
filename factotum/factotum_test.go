@@ -36,6 +36,7 @@ func TestNewFromDir(t *testing.T) {
 		// These should outright fail.
 		{"bad", false, "", "", "", ""},
 		{"empty", false, "", "", "", ""},
+		{"mismatched", false, pubKey, secKey, "", ""},
 	}
 	for _, c := range cases {
 		fi, err := NewFromDir(filepath.Join("testdata", c.dir))
@@ -68,5 +69,35 @@ func TestNewFromDir(t *testing.T) {
 		if got, want := f.keys[f.previous].private, c.prevSecret; got != want {
 			t.Errorf("NewFromDir(%q): got previous secret key %q, want %q", c.dir, got, want)
 		}
+	}
+}
+
+func TestClean(t *testing.T) {
+	f, err := NewFromDir(filepath.Join("testdata", "ok"))
+	if err != nil {
+		t.Errorf("NewFromDir(testdata/ok): %v", err)
+	}
+	fi1 := f.(*factotum)
+	f, err = NewFromDir(filepath.Join("testdata", "comment"))
+	if err != nil {
+		t.Errorf("NewFromDir(testdata/comment): %v", err)
+	}
+	fi2 := f.(*factotum)
+	d1 := fi1.keys[fi1.current].ecdsaKeyPair.D
+	d2 := fi2.keys[fi2.current].ecdsaKeyPair.D
+	if d1.Cmp(d2) != 0 {
+		t.Errorf("NewFromDir: comment improperly affected key")
+	}
+
+}
+
+func TestSign(t *testing.T) {
+	fi, err := NewFromDir(filepath.Join("testdata", "ok"))
+	if err != nil {
+		t.Errorf("NewFromDir(testdata/ok): %v", err)
+	}
+	_, err = fi.Sign([]byte("this is too long a string for p256"))
+	if err == nil {
+		t.Errorf("factotum.Sing(longstring) should have failed")
 	}
 }

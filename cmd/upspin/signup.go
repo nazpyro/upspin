@@ -6,6 +6,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -19,6 +21,7 @@ import (
 
 	"upspin.io/config"
 	"upspin.io/flags"
+	"upspin.io/subcmd"
 	"upspin.io/upspin"
 	"upspin.io/user"
 )
@@ -29,6 +32,13 @@ Signup generates an Upspin configuration file and private/public key pair,
 stores them locally, and sends a signup request to the public Upspin key server
 at key.upspin.io. The server will respond by sending a confirmation email to
 the given email address (or "username").
+
+The email address becomes a username after successful signup but is never
+again used by Upspin to send or receive email. Therefore the email address
+may be disabled once signup is complete if one wishes to have an Upspin
+name distinct from one's regular email address. Either way, if the email
+address is compromised after Upspin signup, the security of the user's
+Upspin data is unaffected.
 
 Signup writes a configuration file to $HOME/upspin/config, holding the
 username and the location of the directory and store servers. It writes the
@@ -55,13 +65,11 @@ file and keys and only send the signup request to the key server.
 		storeServer = fs.String("store", "", "Store server `address`")
 		bothServer  = fs.String("server", "", "Store and Directory server `address` (if combined)")
 		signupOnly  = fs.Bool("signuponly", false, "only send signup request to key server; do not generate config or keys")
-		// This is needed because signup uses command keygen to generate
-		// keys, and keygen requires a rotate flag.
-		_ = fs.Bool("rotate", false, "always false during sign up")
 	)
 	// Used only in keygen.
 	fs.String("curve", "p256", "cryptographic curve `name`: p256, p384, or p521")
-	fs.String("secretseed", "", "128 bit secret `seed` in proquint format")
+	fs.String("secretseed", "", "the seed containing a 128 bit secret in proquint format or a file that contains it")
+	fs.Bool("rotate", false, "always false during sign up")
 
 	s.ParseFlags(fs, args, help, "[-config=<file>] signup -dir=<addr> -store=<addr> [flags] <username>\n       upspin [-config=<file>] signup -server=<addr> [flags] <username>")
 
@@ -135,7 +143,7 @@ file and keys and only send the signup request to the key server.
 		UserName:  userName,
 		Dir:       dirEndpoint,
 		Store:     storeEndpoint,
-		SecretDir: *where,
+		SecretDir: subcmd.Tilde(*where),
 		Packing:   "ee",
 	})
 	if err != nil {
@@ -160,8 +168,8 @@ file and keys and only send the signup request to the key server.
 			s.Exit(err)
 		}
 	}
-	fmt.Println("Configuration file written to:")
-	fmt.Printf("\t%s\n\n", flags.Config)
+	fmt.Fprintf(os.Stderr, "Configuration file written to:\n")
+	fmt.Fprintf(os.Stderr, "\t%s\n\n", flags.Config)
 
 	// Generate a new key.
 	s.keygenCommand(fs)
@@ -178,19 +186,10 @@ func (s *State) registerUser(configFile string) {
 	}
 
 	// Make signup request.
-	vals := url.Values{
-		"name":  {string(cfg.UserName())},
-		"dir":   {string(cfg.DirEndpoint().NetAddr)},
-		"store": {string(cfg.StoreEndpoint().NetAddr)},
-		"key":   {string(cfg.Factotum().PublicKey())},
+	signupURL, err := makeSignupURL(cfg)
+	if err != nil {
+		s.Exit(err)
 	}
-	signupURL := (&url.URL{
-		Scheme:   "https",
-		Host:     "key.upspin.io",
-		Path:     "/signup",
-		RawQuery: vals.Encode(),
-	}).String()
-
 	r, err := http.Post(signupURL, "text/plain", nil)
 	if err != nil {
 		s.Exit(err)
@@ -203,8 +202,26 @@ func (s *State) registerUser(configFile string) {
 	if r.StatusCode != http.StatusOK {
 		s.Exitf("key server error: %s", b)
 	}
-	fmt.Printf("A signup email has been sent to %q,\n", cfg.UserName())
-	fmt.Println("please read it for further instructions.")
+	fmt.Fprintf(os.Stderr, "A signup email has been sent to %q,\n", cfg.UserName())
+	fmt.Fprintf(os.Stderr, "please read it for further instructions.\n")
+}
+
+// makeSignupURL returns an encoded URL used to sign up a new user with the
+// default keyserver.
+func makeSignupURL(cfg upspin.Config) (string, error) {
+	hash, vals := signupRequestHash(cfg.UserName(), cfg.DirEndpoint().NetAddr, cfg.StoreEndpoint().NetAddr, cfg.Factotum().PublicKey())
+	sig, err := cfg.Factotum().Sign(hash)
+	if err != nil {
+		return "", err
+	}
+	vals.Add("sigR", sig.R.String())
+	vals.Add("sigS", sig.S.String())
+	return (&url.URL{
+		Scheme:   "https",
+		Host:     "key.upspin.io",
+		Path:     "/signup",
+		RawQuery: vals.Encode(),
+	}).String(), nil
 }
 
 type configData struct {
@@ -250,4 +267,28 @@ func restoreEnvironment(env []string) {
 		}
 		os.Setenv(kv[0], kv[1])
 	}
+}
+
+// signupRequestHash generates a hash of the supplied arguments
+// that, when signed, is used to prove that a signup request originated
+// from the user that owns the supplied private key.
+// Keep it in sync with cmd/keyserver/signup.go.
+func signupRequestHash(name upspin.UserName, dir, store upspin.NetAddr, key upspin.PublicKey) ([]byte, url.Values) {
+	const magic = "signup-request"
+
+	u := url.Values{}
+	h := sha256.New()
+	h.Write([]byte(magic))
+	w := func(key, val string) {
+		var l [4]byte
+		binary.BigEndian.PutUint32(l[:], uint32(len(val)))
+		h.Write(l[:])
+		h.Write([]byte(val))
+		u.Add(key, val)
+	}
+	w("name", string(name))
+	w("dir", string(dir))
+	w("store", string(store))
+	w("key", string(key))
+	return h.Sum(nil), u
 }

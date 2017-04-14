@@ -23,10 +23,17 @@ import (
 // proxiedDir contains information about a proxied user directoies.
 type proxiedDir struct {
 	l     *clog
-	ep    *upspin.Endpoint // endpoint for directory server
-	order int64            // last order seen in watch
-	atime time.Time        // time of last access
+	atime time.Time // time of last access
 	user  upspin.UserName
+
+	// order is the last order seen in a watch. It is only
+	// set outside the watcher before any watcher starts
+	// while reading the log files.
+	order int64
+
+	// ep is only used outside the watcher and is the
+	// endpoint of the server being watched.
+	ep upspin.Endpoint
 
 	die   chan bool // channel used to tell watcher to die
 	dying chan bool // channel used to confirm watcher is dying
@@ -73,8 +80,15 @@ func (p *proxiedDirs) proxyFor(name upspin.PathName, ep *upspin.Endpoint) {
 	}
 	u := parsed.User()
 	d := p.m[u]
+
+	// If the endpoint changed, kill off the current watcher.
+	if d != nil && d.ep != *ep {
+		d.close()
+		d.ep = *ep
+	}
+
 	if d == nil {
-		d = &proxiedDir{l: p.l, ep: ep, user: u}
+		d = &proxiedDir{l: p.l, ep: *ep, user: u}
 		p.m[u] = d
 	}
 
@@ -85,17 +99,11 @@ func (p *proxiedDirs) proxyFor(name upspin.PathName, ep *upspin.Endpoint) {
 	// watching.
 	d.atime = time.Now()
 
-	// If the endpoint changed, kill off the current watcher.
-	if d.ep != nil && *d.ep != *ep {
-		d.close()
-	}
-
 	// Start a watcher if none is running.
-	d.ep = ep
 	if d.die == nil {
 		d.die = make(chan bool)
 		d.dying = make(chan bool)
-		go d.watcher()
+		go d.watcher(*ep)
 	}
 }
 
@@ -131,8 +139,8 @@ func (d *proxiedDir) close() {
 }
 
 // watcher watches a directory and caches any changes to something already in the LRU.
-func (d *proxiedDir) watcher() {
-	log.Debug.Printf("dircache.Watcher %s %s", d.user, d.ep)
+func (d *proxiedDir) watcher(ep upspin.Endpoint) {
+	log.Debug.Printf("dircache.Watcher %s %s", d.user, ep)
 	defer close(d.dying)
 	nextLogTime := time.Now()
 	// If we don't no better, always read in the whole state. It
@@ -143,16 +151,16 @@ func (d *proxiedDir) watcher() {
 	lastErr := ""
 	seen := 0
 	for {
-		err := d.watch()
+		err := d.watch(ep)
 		if err == nil {
-			log.Debug.Printf("dircache.Watcher %s %s exiting", d.user, d.ep)
+			log.Debug.Printf("dircache.Watcher %s %s exiting", d.user, ep)
 			// watch() only returns if the watcher has been told to die
 			// or if there is an error requiring a new Watch.
 			return
 		}
 		if err == upspin.ErrNotSupported {
 			// Can't survive this.
-			log.Debug.Printf("rpc/dircache.watcher: %s: %s", d.user, err)
+			log.Debug.Printf("dir/dircache.watcher: %s: %s", d.user, err)
 			return
 		}
 		if strings.Contains(err.Error(), "cannot read log at order") {
@@ -170,7 +178,7 @@ func (d *proxiedDir) watcher() {
 		} else {
 			seen = 0
 		}
-		log.Info.Printf("rpc/dircache.watcher: %s: %s", d.user, err)
+		log.Info.Printf("dir/dircache.watcher: %s: %s", d.user, err)
 		nextLogTime = time.Now().Add(time.Minute)
 		lastErr = newErr
 		time.Sleep(time.Second)
@@ -179,8 +187,8 @@ func (d *proxiedDir) watcher() {
 
 // watch loops receiving watch events. It returns nil if told to die.
 // Otherwise it returns whatever error was encountered.
-func (d *proxiedDir) watch() error {
-	dir, err := bind.DirServer(d.l.cfg, *d.ep)
+func (d *proxiedDir) watch(ep upspin.Endpoint) error {
+	dir, err := bind.DirServer(d.l.cfg, ep)
 	if err != nil {
 		return err
 	}
@@ -210,7 +218,6 @@ func (d *proxiedDir) watch() error {
 func (d *proxiedDir) handleEvent(e *upspin.Event) error {
 	// Something odd happened?
 	if e.Error != nil {
-		log.Info.Printf("rpc/dircache.handleEvent: %s", e.Error)
 		return e.Error
 	}
 

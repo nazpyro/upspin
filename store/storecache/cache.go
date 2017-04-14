@@ -52,7 +52,7 @@ type storeCache struct {
 	cfg   upspin.Config
 	sync.Mutex
 	dir   string     // Top directory for cached references.
-	limit int64      // Sort limit of the maximum bytes to store.
+	limit int64      // Soft limit of the maximum bytes to store.
 	lru   *cache.LRU // Key is the reference. Value is &cachedRef.
 	wbq   *writebackQueue
 }
@@ -221,7 +221,9 @@ func (c *storeCache) get(cfg upspin.Config, ref upspin.Reference, e upspin.Endpo
 		return true
 	}
 
-	// If we only see 503 errors, retry in the hope we can live through it.
+	const serviceUnavailable = "503" // String representation of http.StatusServiceUnavailable.
+
+	// If we only see serviceUnavailable errors, retry in the hope we can live through them.
 	for tries := 0; tries < 3; tries++ {
 		var fatal bool
 
@@ -236,12 +238,12 @@ func (c *storeCache) get(cfg upspin.Config, ref upspin.Reference, e upspin.Endpo
 				continue
 			}
 
-			// In case of a 503 error, retry a few times.
+			// In case of a serviceUnavailable error, retry a few times.
 			var locs []upspin.Location
 			var refdata *upspin.Refdata
 			data, refdata, locs, err = store.Get(loc.Reference)
 			if isError(err) {
-				if !strings.Contains(err.Error(), "503") {
+				if !strings.Contains(err.Error(), serviceUnavailable) {
 					fatal = true
 				}
 				continue // locs guaranteed to be nil.
@@ -415,14 +417,15 @@ func (cr *cachedRef) saveToCacheFile(file string, data []byte) error {
 		cleanup()
 		return errors.New("writing cache file")
 	}
-	if err := os.Rename(tmpName, file); err != nil {
-		cleanup()
-		return err
-	}
 	if err := f.Close(); err != nil {
 		cleanup()
 		return err
 	}
+	if err := os.Rename(tmpName, file); err != nil {
+		cleanup()
+		return err
+	}
+
 	cr.size = int64(len(data))
 	cr.valid = true
 	cr.busy = false

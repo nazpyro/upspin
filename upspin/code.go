@@ -7,8 +7,8 @@ package upspin // import "upspin.io/upspin"
 import (
 	"crypto/rand"
 	"encoding/binary"
-	"errors"
-	"fmt" // Cannot use Upspin's error package because it would introduce a dependency cycle.
+	"errors" // Cannot use Upspin's error package because it would introduce a dependency cycle.
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -37,8 +37,7 @@ func (d *DirBlock) MarshalAppend(b []byte) ([]byte, error) {
 	//	NetAddr: count n followed by n bytes.
 	b = append(b, byte(d.Location.Endpoint.Transport))
 	b = appendString(b, string(d.Location.Endpoint.NetAddr))
-	// Location.Key:
-	//	Reference: count n followed by n bytes.
+	// Location.Reference: count n followed by n bytes.
 	b = appendString(b, string(d.Location.Reference))
 
 	// Offset
@@ -177,7 +176,7 @@ func (d *DirEntry) MarshalAppend(b []byte) ([]byte, error) {
 	// Writer.
 	b = appendString(b, string(d.Writer))
 
-	// Name: if different than SignedName, count n followed by n bytes.
+	// Name: if different from SignedName, count n followed by n bytes.
 	// Otherwise, count zero with no bytes following.
 	if d.Name != d.SignedName {
 		b = appendString(b, string(d.Name))

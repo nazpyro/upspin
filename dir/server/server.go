@@ -205,7 +205,7 @@ func (s *server) lookupWithPermissions(op string, name upspin.PathName, opts ...
 	entry, err := s.lookup(op, p, entryMustBeClean, opts...)
 
 	// Check if the user can know about the file at all. If not, to prevent
-	// leaking its existence, return NotExist.
+	// leaking its existence, return Private.
 	if err == upspin.ErrFollowLink {
 		return s.errLink(op, entry, opts...)
 	}
@@ -711,7 +711,7 @@ func (s *server) watch(op string, treeEvents <-chan *upspin.Event, outEvents cha
 		if e.Entry == nil {
 			// It's likely an error. Pass it along. We're sure to
 			// have treeEvents closed in the next loop.
-			outEvents <- *e
+			sendEvent(e)
 			continue
 		}
 
@@ -882,7 +882,7 @@ func (s *server) canCreateRoot(user upspin.UserName) bool {
 }
 
 // errPerm checks whether the user has any right to the given path, and if so
-// returns a Permission error. Otherwise it returns a NotExist error.
+// returns a Permission error. Otherwise it returns a Private error.
 // This is used to prevent probing of the name space.
 func (s *server) errPerm(op string, p path.Parsed, opts ...options) error {
 	// Before returning, check that the user has the right to know,

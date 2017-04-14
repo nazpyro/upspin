@@ -5,6 +5,7 @@
 package perm
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -24,11 +25,9 @@ const (
 )
 
 // setupEnv sets up a test environment, used by the tests in this package.
-// The wait func, when called, blocks until onUpdate fires or a timeout occurs.
-// The cleanup func should be called when the test function exits.
-func setupEnv(t *testing.T) (ownerEnv *testenv.Env, wait, cleanup func()) {
+func setupEnv(t *testing.T) *testenv.Env {
 	var err error
-	ownerEnv, err = testenv.New(&testenv.Setup{
+	env, err := testenv.New(&testenv.Setup{
 		OwnerName: owner,
 		Packing:   upspin.PlainPack,
 		Kind:      "server", // Must implement Watch API.
@@ -36,24 +35,47 @@ func setupEnv(t *testing.T) (ownerEnv *testenv.Env, wait, cleanup func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return env
+}
 
-	updated := make(chan bool)
-	onUpdate = func() { <-updated }
+func newWithEnv(t *testing.T, env *testenv.Env) (perm *Perm, wait, done func()) {
+	wait, onUpdate, onRetry, ready := newStubs(t)
+	cfg := env.Config
+	dir := env.DirServer
+	doneCh := make(chan struct{})
+	done = func() { close(doneCh) }
+	perm = newPerm("newWithEnv", cfg, ready, cfg.UserName(), dir.Lookup, dir.Watch, onUpdate, onRetry, doneCh)
+	return
+}
+
+func newWithConfig(t *testing.T, cfg upspin.Config) (perm *Perm, wait, done func()) {
+	wait, onUpdate, onRetry, ready := newStubs(t)
+	doneCh := make(chan struct{})
+	done = func() { close(doneCh) }
+	perm = newPerm("newWithConfig", cfg, ready, cfg.UserName(), nil, nil, onUpdate, onRetry, doneCh)
+	return
+}
+
+// The wait func, when called, blocks until onUpdate fires or a timeout occurs.
+func newStubs(t *testing.T) (wait, onUpdate, onRetry func(), ready chan struct{}) {
+	update := make(chan bool)
+	ready = make(chan struct{})
+	n := 0
 	wait = func() {
-		const timeout = 2 * time.Second
+		if ready != nil {
+			close(ready)
+			ready = nil
+		}
+		n++
 		select {
-		case <-time.After(timeout):
-			t.Fatal("timed out waiting for update")
-		case updated <- true:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for update %d", n)
+		case update <- true:
 			// OK.
 		}
 	}
-	cleanup = func() {
-		ownerEnv.Exit()
-		close(updated) // Unblock the update loop, if blocked.
-		onUpdate = func() {}
-	}
-
+	onUpdate = func() { <-update }
+	onRetry = func() { time.Sleep(100 * time.Millisecond) }
 	return
 }
 
@@ -67,13 +89,11 @@ func init() {
 }
 
 func TestCantFindFileAllowsAll(t *testing.T) {
-	ownerEnv, wait, cleanup := setupEnv(t)
-	defer cleanup()
+	env := setupEnv(t)
+	defer env.Exit()
 
-	perm, err := New(ownerEnv.Config, readyNow, owner, ownerEnv.DirServer.Lookup, ownerEnv.DirServer.Watch)
-	if err != nil {
-		t.Fatal(err)
-	}
+	perm, wait, done := newWithEnv(t, env)
+	defer done()
 	wait()
 
 	// Everyone is allowed, since we can't read the owner file.
@@ -90,22 +110,20 @@ func TestCantFindFileAllowsAll(t *testing.T) {
 }
 
 func TestNoFileAllowsAll(t *testing.T) {
-	ownerEnv, wait, cleanup := setupEnv(t)
-	defer cleanup()
+	env := setupEnv(t)
+	defer env.Exit()
 
 	// Put a permissive Access file, now server knows the file is not there.
 	r := testenv.NewRunner()
-	r.AddUser(ownerEnv.Config)
+	r.AddUser(env.Config)
 	r.As(owner)
 	r.Put(accessFile, accessContent) // So server can lookup the file.
 	if r.Failed() {
 		t.Fatal(r.Diag())
 	}
 
-	perm, err := New(ownerEnv.Config, readyNow, owner, ownerEnv.DirServer.Lookup, ownerEnv.DirServer.Watch)
-	if err != nil {
-		t.Fatal(err)
-	}
+	perm, wait, done := newWithEnv(t, env)
+	defer done()
 	wait()
 
 	// Everyone is allowed.
@@ -122,11 +140,11 @@ func TestNoFileAllowsAll(t *testing.T) {
 }
 
 func TestAllowsOnlyOwner(t *testing.T) {
-	ownerEnv, wait, cleanup := setupEnv(t)
-	defer cleanup()
+	env := setupEnv(t)
+	defer env.Exit()
 
 	r := testenv.NewRunner()
-	r.AddUser(ownerEnv.Config)
+	r.AddUser(env.Config)
 
 	r.As(owner)
 	r.Put(accessFile, accessContent) // So server can lookup the file.
@@ -136,10 +154,8 @@ func TestAllowsOnlyOwner(t *testing.T) {
 		t.Fatal(r.Diag())
 	}
 
-	perm, err := New(ownerEnv.Config, readyNow, owner, ownerEnv.DirServer.Lookup, ownerEnv.DirServer.Watch)
-	if err != nil {
-		t.Fatal(err)
-	}
+	perm, wait, done := newWithEnv(t, env)
+	defer done()
 	wait()
 
 	// Owner is allowed.
@@ -160,11 +176,11 @@ func TestAllowsOnlyOwner(t *testing.T) {
 }
 
 func TestAllowsOthersAndWildcard(t *testing.T) {
-	ownerEnv, wait, cleanup := setupEnv(t)
-	defer cleanup()
+	env := setupEnv(t)
+	defer env.Exit()
 
 	r := testenv.NewRunner()
-	r.AddUser(ownerEnv.Config)
+	r.AddUser(env.Config)
 
 	r.As(owner)
 	r.Put(accessFile, accessContent) // So server can lookup the file.
@@ -174,10 +190,8 @@ func TestAllowsOthersAndWildcard(t *testing.T) {
 		t.Fatal(r.Diag())
 	}
 
-	perm, err := New(ownerEnv.Config, readyNow, owner, ownerEnv.DirServer.Lookup, ownerEnv.DirServer.Watch)
-	if err != nil {
-		t.Fatal(err)
-	}
+	perm, wait, done := newWithEnv(t, env)
+	defer done()
 	wait() // Update call
 	wait() // Watch event
 
@@ -220,4 +234,73 @@ func TestAllowsOthersAndWildcard(t *testing.T) {
 			t.Errorf("%s is allowed; expected not allowed", user)
 		}
 	}
+}
+
+// Regression test for issue #317.
+func TestSequentialErrorsOK(t *testing.T) {
+	env := setupEnv(t)
+	defer env.Exit()
+
+	wait, onUpdate, onRetry, ready := newStubs(t)
+	cfg := env.Config
+	done := make(chan struct{})
+	defer close(done)
+	newPerm("TestSequentialErrorsOK", cfg, ready, owner, env.DirServer.Lookup, errorReturningWatch, onUpdate, onRetry, done)
+	wait()
+
+	// No crash, no problem.
+}
+
+// Issue #125
+func TestOrderOfPuts(t *testing.T) {
+	env := setupEnv(t)
+	defer env.Exit()
+
+	r := testenv.NewRunner()
+	r.AddUser(env.Config)
+
+	r.As(owner)
+	r.MakeDirectory(groupDir)
+	r.Put(writersGroup, owner+" "+writer)
+	if r.Failed() {
+		t.Fatal(r.Diag())
+	}
+
+	perm, wait, done := newWithEnv(t, env)
+	defer done()
+	wait() // Update call.
+
+	r.Put(accessFile, accessContent) // So server can lookup Writers.
+	if r.Failed() {
+		t.Fatal(r.Diag())
+	}
+	wait() // New watch event.
+
+	// Owner and writer are allowed.
+	for _, user := range []upspin.UserName{
+		owner,
+		writer,
+	} {
+		if !perm.IsWriter(user) {
+			t.Errorf("%s is not allowed, expected allowed", user)
+		}
+	}
+}
+
+func errorReturningWatch(_ upspin.PathName, _ int64, done <-chan struct{}) (<-chan upspin.Event, error) {
+	c := make(chan upspin.Event)
+	go func() {
+		var i int
+		for {
+			err := upspin.Event{Error: fmt.Errorf("error %d", i)}
+			select {
+			case c <- err:
+				i++
+			case <-done:
+				return
+			}
+
+		}
+	}()
+	return c, nil
 }

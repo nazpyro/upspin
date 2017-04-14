@@ -14,8 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
 	"sync"
+
 	"upspin.io/errors"
 	"upspin.io/upspin"
 )
@@ -174,11 +174,11 @@ func (l *Log) Append(e *LogEntry) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	_, err = l.file.Seek(0, io.SeekEnd)
+	prevOffs, err := l.file.Seek(0, io.SeekEnd)
 	if err != nil {
 		return errors.E(op, errors.IO, err)
 	}
-	_, err = l.file.Write(buf)
+	n, err := l.file.Write(buf)
 	if err != nil {
 		return errors.E(op, errors.IO, err)
 	}
@@ -186,43 +186,41 @@ func (l *Log) Append(e *LogEntry) error {
 	if err != nil {
 		return errors.E(op, errors.IO, err)
 	}
+	// Sanity check: flush worked and the new offset is the expected one.
+	newOffs := prevOffs + int64(n)
+	if newOffs != l.lastOffset() {
+		// This might indicate a race somewhere, despite the locks.
+		return errors.E(op, errors.IO, errors.Errorf("file.Sync did not update offset: expected %d, got %d", newOffs, l.lastOffset()))
+	}
 	return nil
 }
 
-// ReadAt reads at most n entries from the log starting at offset. It
-// returns the next offset. In case of error, if dst is not nil it means the
-// error occurred after reading some entries (<n).
-func (l *Log) ReadAt(n int, offset int64) (dst []LogEntry, next int64, err error) {
+// ReadAt reads a log entry from the log starting at offset. It
+// returns the next offset.
+func (l *Log) ReadAt(offset int64) (le LogEntry, next int64, err error) {
 	const op = "dir/server/tree.Log.Read"
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// TODO: don't seek. Use file.ReadAt instead.
+	// We can't ReadAt here since unmarshal does the reading, typically one
+	// byte at a time. So we Seek to the right position instead.
 	fileOffset := l.lastOffset()
 	if offset >= fileOffset {
 		// End of file.
-		return dst, fileOffset, nil
+		return le, fileOffset, nil
 	}
 	_, err = l.file.Seek(offset, io.SeekStart)
 	if err != nil {
-		return nil, 0, errors.E(op, errors.IO, err)
+		return le, 0, errors.E(op, errors.IO, err)
 	}
 	next = offset
-	cbr := newChecker(bufio.NewReader(l.file))
-	for i := 0; i < n; i++ {
-		if next == fileOffset {
-			// End of file.
-			return dst, fileOffset, nil
-		}
-		var le LogEntry
-		err := le.unmarshal(cbr)
-		if err != nil {
-			return dst, next, err
-		}
-		dst = append(dst, le)
-		next = next + int64(cbr.count)
-		cbr.reset()
+	checker := newChecker(l.file)
+	defer checker.close()
+	err = le.unmarshal(checker)
+	if err != nil {
+		return le, 0, errors.E(op, errors.IO, err)
 	}
+	next = next + int64(checker.count)
 	return
 }
 
@@ -263,12 +261,28 @@ func (l *Log) Clone() (*Log, error) {
 	defer l.mu.Unlock()
 
 	f, err := os.Open(l.file.Name())
+	if os.IsNotExist(err) {
+		return nil, errors.E(op, errors.NotExist, err)
+	}
 	if err != nil {
 		return nil, errors.E(op, errors.IO, err)
 	}
 	newLog := *l
 	newLog.file = f
 	return &newLog, nil
+}
+
+// Close closes the log.
+func (l *Log) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.file != nil {
+		err := l.file.Close()
+		l.file = nil
+		return err
+	}
+	return nil
 }
 
 // User returns the user name who owns the root of the tree that this
@@ -330,6 +344,9 @@ func (li *LogIndex) Clone() (*LogIndex, error) {
 	defer li.mu.Unlock()
 
 	idx, err := os.Open(li.indexFile.Name())
+	if os.IsNotExist(err) {
+		return nil, errors.E(op, errors.NotExist, err)
+	}
 	if err != nil {
 		return nil, errors.E(op, errors.IO, err)
 	}
@@ -406,13 +423,37 @@ func (li *LogIndex) SaveOffset(offset int64) error {
 	return overwriteAndSync(op, li.indexFile, tmp[:n])
 }
 
+// Close closes the LogIndex.
+func (li *LogIndex) Close() error {
+	li.mu.Lock()
+	defer li.mu.Unlock()
+
+	var firstErr error
+	if li.indexFile != nil {
+		firstErr = li.indexFile.Close()
+		li.indexFile = nil
+	}
+	if li.rootFile != nil {
+		err := li.rootFile.Close()
+		li.rootFile = nil
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 // marshal packs the LogEntry into a new byte slice for storage.
 func (le *LogEntry) marshal() ([]byte, error) {
 	const op = "dir/server/tree.LogEntry.marshal"
 	var b []byte
-	var tmp [1]byte // For use by PutVarint.
+	var tmp [16]byte // For use by PutVarint.
+	// This should have been b = append(b, byte(le.Op)) since Operation
+	// is known to fit in a byte. However, we already encode it with
+	// Varint and changing it would cause backward-incompatible issues.
 	n := binary.PutVarint(tmp[:], int64(le.Op))
 	b = append(b, tmp[:n]...)
+
 	entry, err := le.Entry.Marshal()
 	if err != nil {
 		return nil, errors.E(op, err)
@@ -450,52 +491,72 @@ type checker struct {
 	chksum [4]byte
 }
 
-func newChecker(r *bufio.Reader) *checker {
-	return &checker{rd: r, chksum: checksumSalt}
+var pool sync.Pool
+
+func newChecker(r io.Reader) *checker {
+	var chk *checker
+	if c, ok := pool.Get().(*checker); c != nil && ok {
+		chk = c
+		chk.reset(r)
+	} else {
+		chk = &checker{rd: bufio.NewReader(r), chksum: checksumSalt}
+	}
+	return chk
 }
 
 // ReadByte implements io.ByteReader.
-func (r *checker) ReadByte() (byte, error) {
-	b, err := r.rd.ReadByte()
+func (c *checker) ReadByte() (byte, error) {
+	b, err := c.rd.ReadByte()
 	if err == nil {
-		r.chksum[r.count%4] = r.chksum[r.count%4] ^ b
-		r.count++
+		c.chksum[c.count%4] = c.chksum[c.count%4] ^ b
+		c.count++
 	}
 	return b, err
 }
 
-// reset resets the checksum and the counting of bytes, without affecting the
-// reader state.
-func (r *checker) reset() {
-	r.count = 0
-	r.chksum = checksumSalt
+// resetChecksum resets the checksum and the counting of bytes, without
+// affecting the reader state.
+func (c *checker) resetChecksum() {
+	c.count = 0
+	c.chksum = checksumSalt
+}
+
+// reset clears all internal state: clears count, checksum and any buffering.
+func (c *checker) reset(rd io.Reader) {
+	c.rd.Reset(rd)
+	c.resetChecksum()
+}
+
+// close closes the checker and releases internal storage. Future uses of it are
+// invalid.
+func (c *checker) close() {
+	c.rd.Reset(nil)
+	pool.Put(c)
 }
 
 // Read implements io.Reader.
-func (r *checker) Read(p []byte) (n int, err error) {
-	n, err = r.rd.Read(p)
+func (c *checker) Read(p []byte) (n int, err error) {
+	n, err = c.rd.Read(p)
 	if err != nil {
 		return
 	}
 	for i := 0; i < n; i++ {
-		offs := r.count + i
-		r.chksum[offs%4] = r.chksum[offs%4] ^ p[i]
+		offs := (c.count + i) % 4
+		c.chksum[offs] = c.chksum[offs] ^ p[i]
 	}
-	r.count += n
+	c.count += n
 	return
 }
 
-func (r *checker) readChecksum() ([4]byte, error) {
-	var c [4]byte
-	n, err := r.rd.Read(c[:])
+func (c *checker) readChecksum() ([4]byte, error) {
+	var chk [4]byte
+
+	n, err := io.ReadFull(c.rd, chk[:])
 	if err != nil {
-		return c, err
+		return chk, err
 	}
-	r.count += n
-	if n != 4 {
-		return c, errors.Str("missing checksum")
-	}
-	return c, nil
+	c.count += n
+	return chk, nil
 }
 
 // unmarshal unpacks a marshaled LogEntry from a Reader and stores it in the
@@ -514,8 +575,9 @@ func (le *LogEntry) unmarshal(r *checker) error {
 	if entrySize <= 0 {
 		return errors.E(op, errors.IO, errors.Errorf("invalid entry size: %d", entrySize))
 	}
+	// Read exactly entrySize bytes.
 	data := make([]byte, entrySize)
-	_, err = r.Read(data)
+	_, err = io.ReadFull(r, data)
 	if err != nil {
 		return errors.E(op, errors.IO, errors.Errorf("reading %d bytes from entry: %s", entrySize, err))
 	}
@@ -524,14 +586,14 @@ func (le *LogEntry) unmarshal(r *checker) error {
 		return errors.E(op, errors.IO, err)
 	}
 	if len(leftOver) != 0 {
-		return errors.E(op, errors.IO, errors.Errorf("%d bytes left; log misaligned", len(leftOver)))
+		return errors.E(op, errors.IO, errors.Errorf("%d bytes left; log misaligned for entry %+v", len(leftOver), le.Entry))
 	}
 	chk, err := r.readChecksum()
 	if err != nil {
 		return errors.E(op, errors.IO, errors.Errorf("reading checksum: %s", err))
 	}
 	if chk != r.chksum {
-		return errors.E(op, errors.IO, errors.Errorf("invalid checksum: got %x, expected %x", r.chksum, chk))
+		return errors.E(op, errors.IO, errors.Errorf("invalid checksum: got %x, expected %x for entry %+v", r.chksum, chk, le.Entry))
 	}
 	return nil
 }

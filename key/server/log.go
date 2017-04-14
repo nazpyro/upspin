@@ -42,7 +42,7 @@ type loggerImpl struct {
 // PutAttempt records a KeyServer.Put attempt
 // by the given actor for the given user record.
 func (l *loggerImpl) PutAttempt(actor upspin.UserName, u *upspin.User) error {
-	if err := l.put("put attempt", actor, u); err != nil {
+	if err := l.put(time.Now(), "put attempt", actor, u); err != nil {
 		return errors.E("key/gcp.Logger.PutAttempt", err)
 	}
 	return nil
@@ -51,7 +51,7 @@ func (l *loggerImpl) PutAttempt(actor upspin.UserName, u *upspin.User) error {
 // PutSuccess records a successful KeyServer.Put
 // by the given actor for the given user record.
 func (l *loggerImpl) PutSuccess(actor upspin.UserName, u *upspin.User) error {
-	if err := l.put("put success", actor, u); err != nil {
+	if err := l.put(time.Now(), "put success", actor, u); err != nil {
 		return errors.E("key/gcp.Logger.PutSuccess", err)
 	}
 	return nil
@@ -59,20 +59,23 @@ func (l *loggerImpl) PutSuccess(actor upspin.UserName, u *upspin.User) error {
 
 var hashPrefix = []byte("SHA256:")
 
-func (l *loggerImpl) put(kind string, actor upspin.UserName, u *upspin.User) error {
+func (l *loggerImpl) put(now time.Time, kind string, actor upspin.UserName, u *upspin.User) error {
 	content, err := json.Marshal(u)
 	if err != nil {
 		return err
 	}
 
-	now := time.Now().In(time.UTC)
-	record := []byte(fmt.Sprintf("%v: %s by %q: %s\n", now, kind, actor, content))
+	record := []byte(fmt.Sprintf("%v: %s by %q: %s\n", now.In(time.UTC), kind, actor, content))
 
 	h := sha256.New()
 	h.Write([]byte(record))
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	if err := l.populate(); err != nil {
+		return err
+	}
 
 	// Include the previous record's hash in the new hash,
 	// but only if there is a previous record.
@@ -86,10 +89,6 @@ func (l *loggerImpl) put(kind string, actor upspin.UserName, u *upspin.User) err
 		// Grab the hash hex, stripping the prefix and trailing newline.
 		prevHash := l.log[i+len(hashPrefix) : len(l.log)-1]
 		h.Write(prevHash)
-	}
-
-	if err := l.populate(); err != nil {
-		return err
 	}
 
 	l.log = append(l.log, record...)

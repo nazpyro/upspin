@@ -21,25 +21,24 @@ run `upspinserver` by following these instructions.
 The following commands must be executed on the server as the super user, `root`,
 perhaps via `sudo su`.
 
-Create a Unix account named `upspin`.
-For the password, use a secure password generator to create a long, unguessable
-password.
-Don't worry if it's unwieldy, you won't need to type it again.
-The rest of the questions it asks should have sane defaults, so pressing
-Enter for each should be sufficient.
+Throughout this document, we will mark commands to be run on your
+local machine with the shell prompt `local$` and commands to be
+run on your server with `server%`, or if running as `root`, `server#`.
+
+Create a Unix account named `upspin`:
 
 ```
-$ adduser upspin
+server# useradd -m upspin
 ```
 
 Give yourself SSH access to the `upspin` account on the server (a convenience):
 
 ```
-$ su upspin
-$ cd $HOME
-$ mkdir .ssh
-$ chmod 0700 .ssh
-$ cat > .ssh/authorized_keys
+server# su upspin
+server% cd $HOME
+server% mkdir .ssh
+server% chmod 0700 .ssh
+server% cat > .ssh/authorized_keys
 (Paste your SSH public key here and type Control-D and Enter)
 ```
 
@@ -48,8 +47,8 @@ $ cat > .ssh/authorized_keys
 From your workstation, run these commands:
 
 ```
-$ GOOS=linux GOARCH=amd64 go build upspin.io/cmd/upspinserver
-$ scp upspinserver upspin@upspin.example.com:.
+local$ GOOS=linux GOARCH=amd64 go build upspin.io/cmd/upspinserver
+local$ scp upspinserver upspin@upspin.example.com:.
 ```
 
 ## Run `upspinserver` on server startup
@@ -86,7 +85,7 @@ we will grant the `upspinserver` binary this capability by using `setcap` (as
 `root`):
 
 ```
-$ setcap cap_net_bind_service=+ep /home/upspin/upspinserver
+server# setcap cap_net_bind_service=+ep /home/upspin/upspinserver
 ```
 
 Note that you need to run this `setcap` command whenever the `upspinserver`
@@ -94,25 +93,19 @@ binary is updated.
 
 ### Start the service
 
-Use `systemctl` to enable the service:
+Use `systemctl` to enable and start the service:
 
 ```
-$ systemctl enable /etc/systemd/system/upspinserver.service
+server# systemctl enable --now /etc/systemd/system/upspinserver.service
 ```
 
-Use `systemctl` to start the service:
-
-```
-$ systemctl start upspinserver.service
-```
-
-You may also use `systemctl stop` and `systemctl restart` to
-stop and restart the server, respectively.
+You may also use `systemctl stop upspinserver` and `systemctl restart
+upspinserver` to stop and restart the server, respectively.
 
 You can use `journalctl` to see the log output of the server:
 
 ```
-$ journalctl -f -u upspinserver.service
+server# journalctl -f -u upspinserver
 
 ```
 

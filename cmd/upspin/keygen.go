@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"upspin.io/config"
 	"upspin.io/errors"
@@ -39,8 +40,9 @@ See the description for rotate for information about updating keys.
 	// there as well.
 	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
 	fs.String("curve", "p256", "cryptographic curve `name`: p256, p384, or p521")
-	fs.String("secretseed", "", "128 bit secret `seed` in proquint format")
+	fs.String("secretseed", "", "the seed containing a 128 bit secret in proquint format or a file that contains it")
 	fs.String("where", filepath.Join(config.Home(), ".ssh"), "`directory` to store keys")
+	// TODO: We do not what rotate to appear in the usage message.
 	fs.Bool("rotate", false, "rotate existing keys and replace them with new ones")
 	s.ParseFlags(fs, args, help, "keygen [-curve=256] [-secretseed=seed] [-where=$HOME/.ssh]")
 	if fs.NArg() != 0 {
@@ -59,75 +61,96 @@ func (s *State) keygenCommand(fs *flag.FlagSet) {
 		fs.Usage()
 	}
 
-	public, private, proquintStr, err := createKeys(curve, subcmd.StringFlag(fs, "secretseed"))
+	secretFlag := subcmd.StringFlag(fs, "secretseed")
+	public, private, secretStr, err := s.createKeys(curve, secretFlag)
 	if err != nil {
 		s.Exitf("creating keys: %v", err)
 	}
 
-	where := subcmd.StringFlag(fs, "where")
+	where := subcmd.Tilde(subcmd.StringFlag(fs, "where"))
 	if where == "" {
 		s.Exitf("-where must not be empty")
 	}
 	rotate := subcmd.BoolFlag(fs, "rotate")
-	err = s.saveKeys(where, rotate)
+	err = s.saveKeys(where, rotate, public, private)
 	if err != nil {
 		s.Exitf("saving previous keys failed, keys not generated: %s", err)
 	}
-	err = writeKeys(where, public, private)
+	private = strings.TrimSpace(private) + " # " + secretStr + "\n"
+	err = s.writeKeys(where, public, private)
 	if err != nil {
 		s.Exitf("writing keys: %v", err)
 	}
-	fmt.Println("Upspin private/public key pair written to:")
-	fmt.Printf("\t%s\n", filepath.Join(where, "public.upspinkey"))
-	fmt.Printf("\t%s\n", filepath.Join(where, "secret.upspinkey"))
-	fmt.Println("This key pair provides access to your Upspin identity and data.")
-	if proquintStr != "" {
-		fmt.Println("If you lose the keys you can re-create them by running this command:")
-		fmt.Printf("\tupspin keygen -secretseed %s\n", proquintStr)
-		fmt.Println("Write this command down and store it in a secure, private place.")
-		fmt.Println("Do not share your private key or this command with anyone.")
-	} else {
-		fmt.Println("Do not share your private key with anyone.")
+	fmt.Fprintln(os.Stderr, "Upspin private/public key pair written to:")
+	fmt.Fprintf(os.Stderr, "\t%s\n", filepath.Join(where, "public.upspinkey"))
+	fmt.Fprintf(os.Stderr, "\t%s\n", filepath.Join(where, "secret.upspinkey"))
+	fmt.Fprintln(os.Stderr, "This key pair provides access to your Upspin identity and data.")
+	if secretFlag == "" {
+		fmt.Fprintln(os.Stderr, "If you lose the keys you can re-create them by running this command:")
+		fmt.Fprintf(os.Stderr, "\tupspin keygen -secretseed %s\n", secretStr)
+		fmt.Fprintln(os.Stderr, "Write this command down and store it in a secure, private place.")
+		fmt.Fprintln(os.Stderr, "Do not share your private key or this command with anyone.")
 	}
 	if rotate {
-		fmt.Println("\nTo install new keys in the key server, see 'upspin rotate -help'.")
+		fmt.Fprintln(os.Stderr, "\nTo install new keys in the key server, see 'upspin rotate -help'.")
 	}
-	fmt.Println()
+	fmt.Fprintln(os.Stderr)
 }
 
-func createKeys(curveName, secret string) (public string, private, proquintStr string, err error) {
+func (s *State) createKeys(curveName, secretFlag string) (public, private, secretStr string, err error) {
 	// Pick secret 128 bits.
 	// TODO(ehg)  Consider whether we are willing to ask users to write long seeds for P521.
 	b := make([]byte, 16)
-	if len(secret) > 0 {
-		if len((secret)) != 47 || (secret)[5] != '-' {
-			log.Printf("expected secret like\n lusab-babad-gutih-tugad.gutuk-bisog-mudof-sakat\n"+
-				"not\n %s\nkey not generated", secret)
-			return "", "", "", errors.E("keygen", errors.Invalid, errors.Str("bad format for secret"))
-		}
-		for i := 0; i < 8; i++ {
-			binary.BigEndian.PutUint16(b[2*i:2*i+2], proquint.Decode([]byte((secret)[6*i:6*i+5])))
-		}
-	} else {
+
+	// There are three cases:
+	// 1) No secretFlag was given. Create a new secret seed.
+	// 2) A secretFlag looks valid. Accept it.
+	// 3) The secretFlag must be a file. Try to read it.
+	switch {
+	case secretFlag == "":
 		ee.GenEntropy(b)
 		proquints := make([]interface{}, 8)
 		for i := 0; i < 8; i++ {
 			proquints[i] = proquint.Encode(binary.BigEndian.Uint16(b[2*i : 2*i+2]))
 		}
-		proquintStr = fmt.Sprintf("%s-%s-%s-%s.%s-%s-%s-%s", proquints...)
+		secretStr = fmt.Sprintf("%s-%s-%s-%s.%s-%s-%s-%s", proquints...)
 		// Ignore punctuation on input;  this format is just to help the user keep their place.
+
+	case validSecretSeed(secretFlag):
+		secretStr = secretFlag
+	default:
+		data, err := ioutil.ReadFile(subcmd.Tilde(secretFlag))
+		if err != nil {
+			return "", "", "", errors.E("keygen", errors.IO, err)
+		}
+		secretStr = strings.TrimSpace(string(data))
+	}
+
+	if !validSecretSeed(secretStr) {
+		log.Printf("expected secret like\n lusab-babad-gutih-tugad.gutuk-bisog-mudof-sakat\n"+
+			"not\n %s\nkey not generated", secretStr)
+		return "", "", "", errors.E("keygen", errors.Invalid, errors.Str("bad format for secret"))
+	}
+	for i := 0; i < 8; i++ {
+		binary.BigEndian.PutUint16(b[2*i:2*i+2], proquint.Decode([]byte((secretStr)[6*i:6*i+5])))
 	}
 
 	pub, priv, err := ee.CreateKeys(curveName, b)
 	if err != nil {
 		return "", "", "", err
 	}
-	return string(pub), priv, proquintStr, nil
+	return string(pub), priv, secretStr, nil
+}
+
+// validSecretSeed reports whether a seed conforms to the proquint format.
+// TODO: this could be more strict.
+func validSecretSeed(seed string) bool {
+	return len(seed) == 47 && seed[5] == '-'
 }
 
 // writeKeyFile writes a single key to its file, removing the file
 // beforehand if necessary due to permission errors.
-func writeKeyFile(name, key string) error {
+func (s *State) writeKeyFile(name, key string) error {
 	const create = os.O_RDWR | os.O_CREATE | os.O_TRUNC
 	fd, err := os.OpenFile(name, create, 0400)
 	if os.IsPermission(err) && os.Remove(name) == nil {
@@ -145,19 +168,19 @@ func writeKeyFile(name, key string) error {
 }
 
 // writeKeys save both the public and private keys to their respective files.
-func writeKeys(where, publicKey, privateKey string) error {
-	err := writeKeyFile(filepath.Join(where, "secret.upspinkey"), privateKey)
+func (s *State) writeKeys(where, publicKey, privateKey string) error {
+	err := s.writeKeyFile(filepath.Join(where, "secret.upspinkey"), privateKey)
 	if err != nil {
 		return err
 	}
-	err = writeKeyFile(filepath.Join(where, "public.upspinkey"), publicKey)
+	err = s.writeKeyFile(filepath.Join(where, "public.upspinkey"), publicKey)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (s *State) saveKeys(where string, rotate bool) error {
+func (s *State) saveKeys(where string, rotate bool, newPublic, newPrivate string) error {
 	var (
 		publicFile  = filepath.Join(where, "public.upspinkey")
 		privateFile = filepath.Join(where, "secret.upspinkey")
@@ -177,11 +200,14 @@ func (s *State) saveKeys(where string, rotate bool) error {
 		return err
 	}
 	if !rotate {
-		s.Exitf("prior keys exist; rerun with -rotate to update keys")
+		s.Exitf("prior keys exist; rerun with rotate command to update keys")
 	}
 	public, err := ioutil.ReadFile(publicFile)
 	if err != nil {
 		return err // Halt. Existing files are corrupted and need manual attention.
+	}
+	if string(public) == newPublic && string(private) == newPrivate {
+		return nil // No need to save duplicates.
 	}
 
 	// Write old key pair to archive file.
@@ -189,8 +215,15 @@ func (s *State) saveKeys(where string, rotate bool) error {
 	if err != nil {
 		return err // We don't have permission to archive old keys?
 	}
-	// TODO(ehg) add file date
-	_, err = fmt.Fprintf(archive, "# EE\n%s%s", public, private)
+
+	var modtime string
+	info, err := os.Stat(privateFile)
+	if err != nil {
+		modtime = ""
+	} else {
+		modtime = info.ModTime().UTC().Format(" 2006-01-02 15:04:05Z")
+	}
+	_, err = fmt.Fprintf(archive, "# EE%s\n%s%s", modtime, public, private)
 	if err != nil {
 		return err
 	}
@@ -198,6 +231,6 @@ func (s *State) saveKeys(where string, rotate bool) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Saved previous key pair to:\n\t%s\n", archiveFile)
+	fmt.Fprintf(os.Stderr, "Saved previous key pair to:\n\t%s\n", archiveFile)
 	return nil
 }
